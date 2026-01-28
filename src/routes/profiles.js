@@ -1,0 +1,254 @@
+import express from 'express';
+import { query } from '../db.js';
+import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+
+const router = express.Router();
+
+function parseLimit(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return 20;
+  return Math.min(Math.floor(num), 100);
+}
+
+function encodeCursor(row) {
+  if (!row) return null;
+  return Buffer.from(JSON.stringify({ created_at: row.created_at, id: row.id })).toString('base64');
+}
+
+function decodeCursor(token) {
+  try {
+    const json = Buffer.from(String(token), 'base64').toString('utf8');
+    const parsed = JSON.parse(json);
+    if (parsed && parsed.created_at && parsed.id) return parsed;
+  } catch (err) {
+    return null;
+  }
+  return null;
+}
+
+router.use(authRequired, fetchCurrentUser);
+
+// 1) List profiles
+router.get('/', async (req, res, next) => {
+  const { q, cursor, include_deleted } = req.query || {};
+  const limit = parseLimit(req.query?.limit);
+  const filters = ['p.user_id = $1'];
+  const params = [req.currentUser.id];
+  let idx = params.length;
+
+  if (!include_deleted || include_deleted === 'false') {
+    filters.push('p.deleted_at IS NULL');
+  }
+
+  if (q) {
+    idx += 1;
+    filters.push(`p.name ILIKE $${idx}`);
+    params.push(`%${q}%`);
+  }
+
+  const decoded = cursor ? decodeCursor(cursor) : null;
+  if (decoded) {
+    idx += 1;
+    const createdAtParam = idx;
+    params.push(decoded.created_at);
+    idx += 1;
+    params.push(decoded.id);
+    filters.push(`(p.created_at, p.id) < ($${createdAtParam}, $${idx})`);
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
+              rt.title AS resume_template_title,
+              p.email_account_id, p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+       FROM profiles p
+       LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
+       WHERE ${filters.join(' AND ')}
+       ORDER BY p.created_at DESC, p.id DESC
+       LIMIT $${params.length + 1}`,
+      [...params, limit + 1]
+    );
+
+    const items = rows.slice(0, limit);
+    const nextCursor = rows.length > limit ? encodeCursor(rows[limit]) : null;
+    return res.json({ items, next_cursor: nextCursor });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 2) Create profile
+router.post('/', async (req, res, next) => {
+  const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
+  if (!name || !resume_template_id) {
+    return res.status(400).json({ error: 'missing_required_fields' });
+  }
+
+  try {
+    const { rows } = await query(
+      `INSERT INTO profiles (user_id, name, description, base_info, base_resume, resume_template_id)
+       VALUES ($1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb), $6)
+       RETURNING id`,
+      [req.currentUser.id, name, description ?? null, base_info ?? null, base_resume ?? null, resume_template_id]
+    );
+    const createdId = rows[0]?.id;
+    const created = await fetchProfileOr404(createdId, true, req.currentUser.id);
+    return res.status(201).json(created);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'duplicate_name' });
+    }
+    next(err);
+  }
+});
+
+async function fetchProfileOr404(profileId, includeDeleted, userId) {
+  const { rows } = await query(
+    `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
+            rt.title AS resume_template_title,
+            p.email_account_id, p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+     FROM profiles p
+     LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
+     WHERE p.id = $1 AND p.user_id = $2 ${includeDeleted ? '' : 'AND p.deleted_at IS NULL'}
+     LIMIT 1`,
+    [profileId, userId]
+  );
+  return rows[0] ?? null;
+}
+
+// 3) Get profile
+router.get('/:profileId', async (req, res, next) => {
+  const includeDeleted = req.query?.include_deleted === 'true';
+  try {
+    const profile = await fetchProfileOr404(req.params.profileId, includeDeleted, req.currentUser.id);
+    if (!profile) return res.status(404).json({ error: 'not_found' });
+    return res.json(profile);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 4) Update profile
+router.patch('/:profileId', async (req, res, next) => {
+  const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
+  const updates = [];
+  const params = [];
+
+  if (name !== undefined) {
+    updates.push(`name = $${updates.length + 3}`);
+    params.push(name);
+  }
+  if (description !== undefined) {
+    updates.push(`description = $${updates.length + 3}`);
+    params.push(description ?? null);
+  }
+  if (base_info !== undefined) {
+    updates.push(`base_info = COALESCE($${updates.length + 3}::jsonb, '{}'::jsonb)`);
+    params.push(base_info);
+  }
+  if (base_resume !== undefined) {
+    updates.push(`base_resume = COALESCE($${updates.length + 3}::jsonb, '{}'::jsonb)`);
+    params.push(base_resume);
+  }
+  if (resume_template_id !== undefined) {
+    updates.push(`resume_template_id = $${updates.length + 3}`);
+    params.push(resume_template_id);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'no_fields_to_update' });
+  }
+
+  try {
+    const { rows } = await query(
+      `UPDATE profiles
+       SET ${updates.join(', ')}
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       RETURNING id`,
+      [req.params.profileId, req.currentUser.id, ...params]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    const updated = await fetchProfileOr404(req.params.profileId, false, req.currentUser.id);
+    return res.json(updated);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'duplicate_name' });
+    next(err);
+  }
+});
+
+// 5) Soft delete profile
+router.delete('/:profileId', async (req, res, next) => {
+  try {
+    const { rowCount } = await query(
+      `UPDATE profiles
+       SET deleted_at = now(), assigned_bidder_user_id = NULL, assigned_at = NULL
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+      [req.params.profileId, req.currentUser.id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'not_found' });
+    return res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function ensureBidderRole(userId) {
+  const { rows } = await query(
+    `SELECT 1
+     FROM user_roles ur
+     JOIN roles r ON r.id = ur.role_id
+     WHERE ur.user_id = $1 AND r.key = 'bidder'
+     LIMIT 1`,
+    [userId]
+  );
+  return rows.length > 0;
+}
+
+async function updateAssignment(profileId, userId, bidderUserId) {
+  const setClause = bidderUserId
+    ? 'assigned_bidder_user_id = $3, assigned_at = now()'
+    : 'assigned_bidder_user_id = NULL, assigned_at = NULL';
+
+  const params = bidderUserId ? [profileId, userId, bidderUserId] : [profileId, userId];
+
+  const { rows } = await query(
+    `UPDATE profiles
+     SET ${setClause}
+     WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+     RETURNING id`,
+    params
+  );
+  const updatedId = rows[0]?.id;
+  if (!updatedId) return null;
+  return fetchProfileOr404(updatedId, false, userId);
+}
+
+// 6) Assign bidder
+router.post('/:profileId/assign-bidder', async (req, res, next) => {
+  const { bidder_user_id } = req.body || {};
+  if (!bidder_user_id) return res.status(400).json({ error: 'missing_bidder_user_id' });
+
+  try {
+    const hasRole = await ensureBidderRole(bidder_user_id);
+    if (!hasRole) return res.status(400).json({ error: 'bidder_user_missing_role' });
+
+    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, bidder_user_id);
+    if (!profile) return res.status(404).json({ error: 'not_found' });
+    return res.json(profile);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 7) Unassign bidder
+router.post('/:profileId/unassign-bidder', async (req, res, next) => {
+  try {
+    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null);
+    if (!profile) return res.status(404).json({ error: 'not_found' });
+    return res.json(profile);
+  } catch (err) {
+    next(err);
+  }
+});
+
+export default router;
