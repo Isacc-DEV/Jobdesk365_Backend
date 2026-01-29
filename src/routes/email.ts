@@ -5,7 +5,7 @@ import { getClient } from '../db.js';
 
 const router = express.Router();
 
-const getFrontendOrigin = () => {
+const getFrontendOrigin = (): string => {
   try {
     return new URL(config.frontendUrl).origin;
   } catch (err) {
@@ -13,7 +13,13 @@ const getFrontendOrigin = () => {
   }
 };
 
-const renderCallbackPage = ({ status, profileId, message }) => {
+type CallbackPageInput = {
+  status: 'success' | 'error';
+  profileId?: string | null;
+  message?: string | null;
+};
+
+const renderCallbackPage = ({ status, profileId, message }: CallbackPageInput): string => {
   const frontendOrigin = getFrontendOrigin();
   const payload = {
     type: status === 'success' ? 'email_connected' : 'email_connect_error',
@@ -56,7 +62,7 @@ const renderCallbackPage = ({ status, profileId, message }) => {
 </html>`;
 };
 
-const buildTokenRequest = (code) => {
+const buildTokenRequest = (code: string): string => {
   const params = new URLSearchParams({
     client_id: config.outlook.clientId,
     client_secret: config.outlook.clientSecret,
@@ -67,7 +73,7 @@ const buildTokenRequest = (code) => {
   return params.toString();
 };
 
-const fetchJson = async (response) => {
+const fetchJson = async (response: Response): Promise<Record<string, any>> => {
   const text = await response.text();
   if (!text) return {};
   try {
@@ -78,10 +84,14 @@ const fetchJson = async (response) => {
 };
 
 router.get('/outlook/callback', async (req, res, next) => {
-  const { code, state, error, error_description } = req.query || {};
+  const code = typeof req.query?.code === 'string' ? req.query.code : undefined;
+  const state = typeof req.query?.state === 'string' ? req.query.state : undefined;
+  const error = typeof req.query?.error === 'string' ? req.query.error : undefined;
+  const errorDescription =
+    typeof req.query?.error_description === 'string' ? req.query.error_description : undefined;
 
   if (error) {
-    const message = error_description || error;
+    const message = errorDescription || error;
     return res.status(400).send(renderCallbackPage({ status: 'error', message }));
   }
 

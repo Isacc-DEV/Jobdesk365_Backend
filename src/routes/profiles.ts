@@ -6,18 +6,20 @@ import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
 
-function parseLimit(value) {
+function parseLimit(value: unknown): number {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return 20;
   return Math.min(Math.floor(num), 100);
 }
 
-function encodeCursor(row) {
+type CursorRow = { created_at: string | Date; id: string };
+
+function encodeCursor(row?: CursorRow | null): string | null {
   if (!row) return null;
   return Buffer.from(JSON.stringify({ created_at: row.created_at, id: row.id })).toString('base64');
 }
 
-function decodeCursor(token) {
+function decodeCursor(token: unknown): CursorRow | null {
   try {
     const json = Buffer.from(String(token), 'base64').toString('utf8');
     const parsed = JSON.parse(json);
@@ -28,11 +30,11 @@ function decodeCursor(token) {
   return null;
 }
 
-function isOutlookConfigured() {
+function isOutlookConfigured(): boolean {
   return Boolean(config.outlook.clientId && config.outlook.clientSecret && config.outlook.redirectUri);
 }
 
-function buildOutlookAuthorizeUrl(state) {
+function buildOutlookAuthorizeUrl(state: string): string {
   const params = new URLSearchParams({
     client_id: config.outlook.clientId,
     response_type: 'code',
@@ -51,7 +53,7 @@ router.get('/', async (req, res, next) => {
   const { q, cursor, include_deleted } = req.query || {};
   const limit = parseLimit(req.query?.limit);
   const filters = ['p.user_id = $1'];
-  const params = [req.currentUser.id];
+  const params: Array<string | number | Date | null> = [req.currentUser.id];
   let idx = params.length;
 
   if (!include_deleted || include_deleted === 'false') {
@@ -90,7 +92,7 @@ router.get('/', async (req, res, next) => {
     );
 
     const items = rows.slice(0, limit);
-    const nextCursor = rows.length > limit ? encodeCursor(rows[limit]) : null;
+    const nextCursor = rows.length > limit ? encodeCursor(rows[limit] as CursorRow) : null;
     return res.json({ items, next_cursor: nextCursor });
   } catch (err) {
     next(err);
@@ -122,7 +124,11 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-async function fetchProfileOr404(profileId, includeDeleted, userId) {
+async function fetchProfileOr404(
+  profileId: string,
+  includeDeleted: boolean,
+  userId: string
+): Promise<any | null> {
   const { rows } = await query(
     `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
             rt.title AS resume_template_title,
@@ -214,7 +220,7 @@ router.delete('/:profileId', async (req, res, next) => {
   }
 });
 
-async function ensureBidderRole(userId) {
+async function ensureBidderRole(userId: string): Promise<boolean> {
   const { rows } = await query(
     `SELECT 1
      FROM user_roles ur
@@ -226,7 +232,11 @@ async function ensureBidderRole(userId) {
   return rows.length > 0;
 }
 
-async function updateAssignment(profileId, userId, bidderUserId) {
+async function updateAssignment(
+  profileId: string,
+  userId: string,
+  bidderUserId: string | null
+): Promise<any | null> {
   const setClause = bidderUserId
     ? 'assigned_bidder_user_id = $3, assigned_at = now()'
     : 'assigned_bidder_user_id = NULL, assigned_at = NULL';

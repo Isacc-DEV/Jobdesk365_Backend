@@ -3,7 +3,16 @@ import { Client } from 'pg';
 
 dotenv.config();
 
-const config = {
+type DbConfig = {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  ssl: boolean;
+};
+
+const config: DbConfig = {
   host: process.env.DB_HOST || 'localhost',
   port: Number(process.env.DB_PORT || 5432),
   user: process.env.DB_USER || 'postgres',
@@ -14,9 +23,9 @@ const config = {
 
 const maintenanceDb = process.env.DB_MAINTENANCE_DB || 'postgres';
 
-const log = (message) => console.log(`[init] ${message}`);
+const log = (message: string) => console.log(`[init] ${message}`);
 
-const escapeIdent = (value) => `"${String(value).replace(/"/g, '""')}"`;
+const escapeIdent = (value: string) => `"${String(value).replace(/"/g, '""')}"`;
 
 async function ensureDatabaseExists() {
   const adminClient = new Client({ ...config, database: maintenanceDb });

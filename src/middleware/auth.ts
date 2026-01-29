@@ -1,8 +1,24 @@
 import jwt from 'jsonwebtoken';
+import type { JwtPayload } from 'jsonwebtoken';
+import type { NextFunction, Request, Response } from 'express';
 import { config } from '../config.js';
 import { query } from '../db.js';
 
-export function authRequired(req, res, next) {
+type TokenPayload = JwtPayload & { id?: string; email?: string; plan?: string };
+type CurrentUser = {
+  id: string;
+  email: string;
+  username: string;
+  display_name: string | null;
+  bio: string | null;
+  photo_link: string | null;
+  plan: string;
+  verified: boolean;
+  created_at: string | Date;
+  updated_at: string | Date;
+};
+
+export function authRequired(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'missing_token' });
@@ -10,7 +26,7 @@ export function authRequired(req, res, next) {
 
   const token = header.slice('Bearer '.length);
   try {
-    const payload = jwt.verify(token, config.jwt.secret);
+    const payload = jwt.verify(token, config.jwt.secret) as TokenPayload;
     req.user = payload;
     return next();
   } catch (err) {
@@ -18,10 +34,10 @@ export function authRequired(req, res, next) {
   }
 }
 
-export async function fetchCurrentUser(req, res, next) {
+export async function fetchCurrentUser(req: Request, res: Response, next: NextFunction) {
   if (!req.user?.id) return res.status(401).json({ error: 'invalid_token' });
   try {
-    const { rows } = await query(
+    const { rows } = await query<CurrentUser>(
       `SELECT id, email, username, display_name, bio, photo_link, plan, verified, created_at, updated_at
        FROM users WHERE id = $1 AND deleted_at IS NULL`,
       [req.user.id]
