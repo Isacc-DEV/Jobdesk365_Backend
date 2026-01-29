@@ -5,6 +5,7 @@ import { config } from './config.js';
 import authRoutes from './routes/auth.js';
 import profileRoutes from './routes/profiles.js';
 import templateRoutes from './routes/templates.js';
+import emailRoutes from './routes/email.js';
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISO
 app.use('/auth', authRoutes);
 app.use('/profiles', profileRoutes);
 app.use('/templates', templateRoutes);
+app.use('/email', emailRoutes);
 
 // Error handler
 app.use((err, req, res, _next) => {

@@ -1,5 +1,7 @@
 import express from 'express';
+import jwt from 'jsonwebtoken';
 import { query } from '../db.js';
+import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -24,6 +26,22 @@ function decodeCursor(token) {
     return null;
   }
   return null;
+}
+
+function isOutlookConfigured() {
+  return Boolean(config.outlook.clientId && config.outlook.clientSecret && config.outlook.redirectUri);
+}
+
+function buildOutlookAuthorizeUrl(state) {
+  const params = new URLSearchParams({
+    client_id: config.outlook.clientId,
+    response_type: 'code',
+    redirect_uri: config.outlook.redirectUri,
+    response_mode: 'query',
+    scope: config.outlook.scopes.join(' '),
+    state
+  });
+  return `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
 }
 
 router.use(authRequired, fetchCurrentUser);
@@ -60,9 +78,11 @@ router.get('/', async (req, res, next) => {
     const { rows } = await query(
       `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
               rt.title AS resume_template_title,
-              p.email_account_id, p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+              p.email_account_id, ea.email_address, ea.status AS email_connection_status,
+              p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
        FROM profiles p
        LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
+       LEFT JOIN email_accounts ea ON ea.id = p.email_account_id
        WHERE ${filters.join(' AND ')}
        ORDER BY p.created_at DESC, p.id DESC
        LIMIT $${params.length + 1}`,
@@ -106,9 +126,11 @@ async function fetchProfileOr404(profileId, includeDeleted, userId) {
   const { rows } = await query(
     `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
             rt.title AS resume_template_title,
-            p.email_account_id, p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+            p.email_account_id, ea.email_address, ea.status AS email_connection_status,
+            p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
      FROM profiles p
      LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
+     LEFT JOIN email_accounts ea ON ea.id = p.email_account_id
      WHERE p.id = $1 AND p.user_id = $2 ${includeDeleted ? '' : 'AND p.deleted_at IS NULL'}
      LIMIT 1`,
     [profileId, userId]
@@ -246,6 +268,39 @@ router.post('/:profileId/unassign-bidder', async (req, res, next) => {
     const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null);
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 8) Start Outlook email connection
+router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
+  if (!isOutlookConfigured()) {
+    return res.status(503).json({ error: 'outlook_not_configured' });
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT id
+       FROM profiles
+       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       LIMIT 1`,
+      [req.params.profileId, req.currentUser.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+
+    const state = jwt.sign(
+      {
+        purpose: 'outlook_connect',
+        profile_id: req.params.profileId,
+        user_id: req.currentUser.id
+      },
+      config.jwt.secret,
+      { expiresIn: '10m' }
+    );
+
+    const url = buildOutlookAuthorizeUrl(state);
+    return res.json({ url });
   } catch (err) {
     next(err);
   }
