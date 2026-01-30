@@ -6,6 +6,7 @@ import authRoutes from './routes/auth.js';
 import profileRoutes from './routes/profiles.js';
 import templateRoutes from './routes/templates.js';
 import emailRoutes from './routes/email.js';
+import calendarRoutes from './routes/calendar.js';
 
 const app = express();
 
@@ -38,6 +39,7 @@ app.use('/auth', authRoutes);
 app.use('/profiles', profileRoutes);
 app.use('/templates', templateRoutes);
 app.use('/email', emailRoutes);
+app.use('/calendar', calendarRoutes);
 
 // Error handler
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

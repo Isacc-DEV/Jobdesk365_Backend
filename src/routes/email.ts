@@ -1,9 +1,16 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config.js';
-import { getClient } from '../db.js';
+import { getClient, query } from '../db.js';
+import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+
+function parseLimit(value: unknown): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return 50;
+  return Math.min(Math.floor(num), 200);
+}
 
 const getFrontendOrigin = (): string => {
   try {
@@ -62,6 +69,259 @@ const renderCallbackPage = ({ status, profileId, message }: CallbackPageInput): 
 </html>`;
 };
 
+const fetchJson = async (response: Response): Promise<Record<string, any>> => {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return { error: 'invalid_json', error_description: text };
+  }
+};
+
+router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) => {
+  try {
+    const { rows } = await query(
+      `SELECT p.id AS profile_id,
+              p.name AS profile_name,
+              p.email_account_id,
+              ea.email_address,
+              ea.status,
+              COUNT(e.id) FILTER (WHERE e.is_unread) AS unread_count
+       FROM profiles p
+       JOIN email_accounts ea ON ea.id = p.email_account_id
+       LEFT JOIN emails e ON e.email_account_id = p.email_account_id
+       WHERE p.user_id = $1 AND p.deleted_at IS NULL
+       GROUP BY p.id, ea.id
+       ORDER BY p.created_at DESC`,
+      [req.currentUser.id]
+    );
+    return res.json({ items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) => {
+  const accountId = typeof req.query?.account_id === 'string' ? req.query.account_id : null;
+  if (!accountId) {
+    return res.status(400).json({ error: 'missing_account_id' });
+  }
+  const limit = parseLimit(req.query?.limit);
+
+  try {
+    const { rows } = await query(
+      `SELECT e.id,
+              e.email_account_id,
+              e.subject,
+              e.from_email,
+              e.snippet,
+              e.received_at,
+              e.is_unread
+       FROM emails e
+       JOIN profiles p ON p.email_account_id = e.email_account_id
+       WHERE p.user_id = $1
+         AND p.deleted_at IS NULL
+         AND e.email_account_id = $2
+       ORDER BY e.received_at DESC NULLS LAST, e.created_at DESC
+       LIMIT $3`,
+      [req.currentUser.id, accountId, limit]
+    );
+    return res.json({ items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const buildRefreshRequest = (refreshToken: string): string => {
+  const params = new URLSearchParams({
+    client_id: config.outlook.clientId,
+    client_secret: config.outlook.clientSecret,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    scope: config.outlook.scopes.join(' ')
+  });
+  return params.toString();
+};
+
+const isTokenExpiring = (tokenExpiresAt: string | Date | null, bufferSeconds = 120): boolean => {
+  if (!tokenExpiresAt) return false;
+  const expiresAt = new Date(tokenExpiresAt).getTime();
+  if (!Number.isFinite(expiresAt)) return false;
+  return expiresAt - Date.now() <= bufferSeconds * 1000;
+};
+
+const fetchOutlookMessages = async (accessToken: string, limit: number) => {
+  const url = new URL('https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages');
+  url.searchParams.set('$select', 'id,subject,from,bodyPreview,receivedDateTime,isRead');
+  url.searchParams.set('$top', String(limit));
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+  const data = await fetchJson(response);
+  return { response, data };
+};
+
+router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
+  const accountId =
+    typeof req.body?.account_id === 'string'
+      ? req.body.account_id
+      : typeof req.query?.account_id === 'string'
+        ? req.query.account_id
+        : null;
+  if (!accountId) {
+    return res.status(400).json({ error: 'missing_account_id' });
+  }
+  const limit = parseLimit(req.body?.limit ?? req.query?.limit);
+
+  try {
+    const { rows } = await query(
+      `SELECT ea.id,
+              ea.provider,
+              ea.access_token,
+              ea.refresh_token,
+              ea.token_expires_at,
+              p.id AS profile_id
+       FROM profiles p
+       JOIN email_accounts ea ON ea.id = p.email_account_id
+       WHERE p.user_id = $1 AND p.deleted_at IS NULL AND ea.id = $2
+       LIMIT 1`,
+      [req.currentUser.id, accountId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'account_not_found' });
+    }
+
+    const account = rows[0];
+    if (account.provider !== 'outlook') {
+      return res.status(400).json({ error: 'unsupported_provider' });
+    }
+
+    let accessToken: string | null = account.access_token;
+    let refreshToken: string | null = account.refresh_token;
+    let tokenExpiresAt: string | Date | null = account.token_expires_at;
+
+    const refreshTokens = async (): Promise<boolean> => {
+      if (!refreshToken) return false;
+      const tokenResponse = await fetch(
+        `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/token`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: buildRefreshRequest(refreshToken)
+        }
+      );
+      const tokenData = await fetchJson(tokenResponse);
+      if (!tokenResponse.ok) {
+        return false;
+      }
+      const nextAccessToken = tokenData.access_token;
+      if (!nextAccessToken) {
+        return false;
+      }
+      const nextRefreshToken = tokenData.refresh_token || refreshToken;
+      const expiresIn = Number(tokenData.expires_in || 0);
+      const nextExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+        ? new Date(Date.now() + expiresIn * 1000)
+        : null;
+      await query(
+        `UPDATE email_accounts
+         SET access_token = $1,
+             refresh_token = $2,
+             token_expires_at = $3,
+             status = 'active'
+         WHERE id = $4`,
+        [nextAccessToken, nextRefreshToken, nextExpiresAt, accountId]
+      );
+      accessToken = nextAccessToken;
+      refreshToken = nextRefreshToken;
+      tokenExpiresAt = nextExpiresAt;
+      return true;
+    };
+
+    if (!accessToken || isTokenExpiring(tokenExpiresAt)) {
+      const refreshed = await refreshTokens();
+      if (!refreshed) {
+        await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [accountId]);
+        return res.status(401).json({ error: 'token_refresh_failed' });
+      }
+    }
+
+    let fetchResult = await fetchOutlookMessages(accessToken as string, limit);
+    if (!fetchResult.response.ok && fetchResult.response.status === 401 && refreshToken) {
+      const refreshed = await refreshTokens();
+      if (refreshed) {
+        fetchResult = await fetchOutlookMessages(accessToken as string, limit);
+      }
+    }
+
+    if (!fetchResult.response.ok) {
+      await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [accountId]);
+      const message =
+        fetchResult.data?.error?.message ||
+        fetchResult.data?.error_description ||
+        'Failed to fetch emails.';
+      return res.status(fetchResult.response.status).json({ error: 'sync_failed', message });
+    }
+
+    const messages = Array.isArray(fetchResult.data?.value) ? fetchResult.data.value : [];
+    const now = new Date();
+    let upserted = 0;
+
+    if (messages.length > 0) {
+      const values: string[] = [];
+      const params: Array<string | boolean | Date | null> = [];
+
+      messages.forEach((message: any, index: number) => {
+        const offset = index * 9;
+        values.push(
+          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9})`
+        );
+        params.push(
+          accountId,
+          account.profile_id,
+          message.id,
+          message.subject ?? null,
+          message.from?.emailAddress?.address ?? null,
+          message.bodyPreview ?? null,
+          message.receivedDateTime ? new Date(message.receivedDateTime) : null,
+          !message.isRead,
+          now
+        );
+      });
+
+      const result = await query(
+        `INSERT INTO emails
+         (email_account_id, profile_id, external_message_id, subject, from_email, snippet, received_at, is_unread, synced_at)
+         VALUES ${values.join(', ')}
+         ON CONFLICT (external_message_id)
+         DO UPDATE SET
+           subject = EXCLUDED.subject,
+           from_email = EXCLUDED.from_email,
+           snippet = EXCLUDED.snippet,
+           received_at = EXCLUDED.received_at,
+           is_unread = EXCLUDED.is_unread,
+           synced_at = EXCLUDED.synced_at,
+           profile_id = EXCLUDED.profile_id
+         WHERE emails.email_account_id = EXCLUDED.email_account_id
+         RETURNING id`,
+        params
+      );
+      upserted = result.rowCount;
+    }
+
+    await query(`UPDATE email_accounts SET status = 'active' WHERE id = $1`, [accountId]);
+    return res.json({ fetched: messages.length, upserted });
+  } catch (err) {
+    next(err);
+  }
+});
+
 const buildTokenRequest = (code: string): string => {
   const params = new URLSearchParams({
     client_id: config.outlook.clientId,
@@ -71,16 +331,6 @@ const buildTokenRequest = (code: string): string => {
     redirect_uri: config.outlook.redirectUri
   });
   return params.toString();
-};
-
-const fetchJson = async (response: Response): Promise<Record<string, any>> => {
-  const text = await response.text();
-  if (!text) return {};
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    return { error: 'invalid_json', error_description: text };
-  }
 };
 
 router.get('/outlook/callback', async (req, res, next) => {
