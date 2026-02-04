@@ -91,7 +91,7 @@ router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) =
        FROM profiles p
        JOIN email_accounts ea ON ea.id = p.email_account_id
        LEFT JOIN emails e ON e.email_account_id = p.email_account_id
-       WHERE p.user_id = $1 AND p.deleted_at IS NULL
+       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL
        GROUP BY p.id, ea.id
        ORDER BY p.created_at DESC`,
       [req.currentUser.id]
@@ -120,7 +120,7 @@ router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) =
               e.is_unread
        FROM emails e
        JOIN profiles p ON p.email_account_id = e.email_account_id
-       WHERE p.user_id = $1
+       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1)
          AND p.deleted_at IS NULL
          AND e.email_account_id = $2
        ORDER BY e.received_at DESC NULLS LAST, e.created_at DESC
@@ -128,6 +128,271 @@ router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) =
       [req.currentUser.id, accountId, limit]
     );
     return res.json({ items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/messages/:emailId', authRequired, fetchCurrentUser, async (req, res, next) => {
+  const emailId = typeof req.params?.emailId === 'string' ? req.params.emailId : null;
+  if (!emailId) {
+    return res.status(400).json({ error: 'missing_email_id' });
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT e.id,
+              e.email_account_id,
+              e.external_message_id,
+              e.subject,
+              e.from_email,
+              e.snippet,
+              e.received_at,
+              e.is_unread,
+              ea.provider,
+              ea.access_token,
+              ea.refresh_token,
+              ea.token_expires_at,
+              ea.email_address
+       FROM emails e
+       JOIN email_accounts ea ON ea.id = e.email_account_id
+       JOIN profiles p ON p.email_account_id = e.email_account_id
+       WHERE e.id = $1
+         AND (p.user_id = $2 OR p.assigned_bidder_user_id = $2)
+         AND p.deleted_at IS NULL
+       LIMIT 1`,
+      [emailId, req.currentUser.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'email_not_found' });
+    }
+
+    const record = rows[0];
+    if (record.provider !== 'outlook') {
+      return res.status(400).json({ error: 'unsupported_provider' });
+    }
+
+    let accessToken: string | null = record.access_token;
+    let refreshToken: string | null = record.refresh_token;
+    let tokenExpiresAt: string | Date | null = record.token_expires_at;
+
+    const refreshTokens = async (): Promise<boolean> => {
+      if (!refreshToken) return false;
+      const tokenResponse = await fetch(
+        `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/token`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          },
+          body: buildRefreshRequest(refreshToken)
+        }
+      );
+      const tokenData = await fetchJson(tokenResponse);
+      if (!tokenResponse.ok) {
+        return false;
+      }
+      const nextAccessToken = tokenData.access_token;
+      if (!nextAccessToken) {
+        return false;
+      }
+      const nextRefreshToken = tokenData.refresh_token || refreshToken;
+      const expiresIn = Number(tokenData.expires_in || 0);
+      const nextExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+        ? new Date(Date.now() + expiresIn * 1000)
+        : null;
+      await query(
+        `UPDATE email_accounts
+         SET access_token = $1,
+             refresh_token = $2,
+             token_expires_at = $3,
+             status = 'active'
+         WHERE id = $4`,
+        [nextAccessToken, nextRefreshToken, nextExpiresAt, record.email_account_id]
+      );
+      accessToken = nextAccessToken;
+      refreshToken = nextRefreshToken;
+      tokenExpiresAt = nextExpiresAt;
+      return true;
+    };
+
+    if (!accessToken || isTokenExpiring(tokenExpiresAt)) {
+      const refreshed = await refreshTokens();
+      if (!refreshed) {
+        await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [
+          record.email_account_id
+        ]);
+        return res.status(401).json({ error: 'token_refresh_failed' });
+      }
+    }
+
+    let fetchResult = await fetchOutlookMessage(accessToken as string, record.external_message_id);
+    if (!fetchResult.response.ok && fetchResult.response.status === 401 && refreshToken) {
+      const refreshed = await refreshTokens();
+      if (refreshed) {
+        fetchResult = await fetchOutlookMessage(accessToken as string, record.external_message_id);
+      }
+    }
+
+    if (!fetchResult.response.ok) {
+      await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [
+        record.email_account_id
+      ]);
+      const message =
+        fetchResult.data?.error?.message ||
+        fetchResult.data?.error_description ||
+        'Failed to fetch email.';
+      return res.status(fetchResult.response.status).json({ error: 'message_fetch_failed', message });
+    }
+
+    const mapRecipients = (recipients: any[]) =>
+      Array.isArray(recipients)
+        ? recipients
+            .map((recipient) => ({
+              name: recipient?.emailAddress?.name ?? '',
+              email: recipient?.emailAddress?.address ?? ''
+            }))
+            .filter((recipient) => recipient.email || recipient.name)
+        : [];
+
+    return res.json({
+      id: record.id,
+      accountId: record.email_account_id,
+      accountEmail: record.email_address,
+      subject: fetchResult.data?.subject ?? record.subject ?? '(No subject)',
+      from: fetchResult.data?.from?.emailAddress?.address ?? record.from_email ?? '',
+      fromName: fetchResult.data?.from?.emailAddress?.name ?? null,
+      to: mapRecipients(fetchResult.data?.toRecipients),
+      cc: mapRecipients(fetchResult.data?.ccRecipients),
+      receivedAt: fetchResult.data?.receivedDateTime ?? record.received_at ?? null,
+      isRead:
+        typeof fetchResult.data?.isRead === 'boolean'
+          ? fetchResult.data.isRead
+          : !record.is_unread,
+      snippet: fetchResult.data?.bodyPreview ?? record.snippet ?? '',
+      body: fetchResult.data?.body?.content ?? null,
+      bodyType: fetchResult.data?.body?.contentType ?? null
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/messages/:emailId/read', authRequired, fetchCurrentUser, async (req, res, next) => {
+  const emailId = typeof req.params?.emailId === 'string' ? req.params.emailId : null;
+  if (!emailId) {
+    return res.status(400).json({ error: 'missing_email_id' });
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT e.id,
+              e.email_account_id,
+              e.external_message_id,
+              e.is_unread,
+              ea.provider,
+              ea.access_token,
+              ea.refresh_token,
+              ea.token_expires_at
+       FROM emails e
+       JOIN email_accounts ea ON ea.id = e.email_account_id
+       JOIN profiles p ON p.email_account_id = e.email_account_id
+       WHERE e.id = $1
+         AND (p.user_id = $2 OR p.assigned_bidder_user_id = $2)
+         AND p.deleted_at IS NULL
+       LIMIT 1`,
+      [emailId, req.currentUser.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'email_not_found' });
+    }
+
+    const record = rows[0];
+    if (!record.is_unread) {
+      return res.json({ ok: true, updated: false });
+    }
+
+    if (record.provider === 'outlook') {
+      let accessToken: string | null = record.access_token;
+      let refreshToken: string | null = record.refresh_token;
+      let tokenExpiresAt: string | Date | null = record.token_expires_at;
+
+      const refreshTokens = async (): Promise<boolean> => {
+        if (!refreshToken) return false;
+        const tokenResponse = await fetch(
+          `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/token`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: buildRefreshRequest(refreshToken)
+          }
+        );
+        const tokenData = await fetchJson(tokenResponse);
+        if (!tokenResponse.ok) {
+          return false;
+        }
+        const nextAccessToken = tokenData.access_token;
+        if (!nextAccessToken) {
+          return false;
+        }
+        const nextRefreshToken = tokenData.refresh_token || refreshToken;
+        const expiresIn = Number(tokenData.expires_in || 0);
+        const nextExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+          ? new Date(Date.now() + expiresIn * 1000)
+          : null;
+        await query(
+          `UPDATE email_accounts
+           SET access_token = $1,
+               refresh_token = $2,
+               token_expires_at = $3,
+               status = 'active'
+           WHERE id = $4`,
+          [nextAccessToken, nextRefreshToken, nextExpiresAt, record.email_account_id]
+        );
+        accessToken = nextAccessToken;
+        refreshToken = nextRefreshToken;
+        tokenExpiresAt = nextExpiresAt;
+        return true;
+      };
+
+      if (!accessToken || isTokenExpiring(tokenExpiresAt)) {
+        const refreshed = await refreshTokens();
+        if (!refreshed) {
+          await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [
+            record.email_account_id
+          ]);
+        }
+      }
+
+      if (accessToken) {
+        let updateResult = await updateOutlookMessageRead(
+          accessToken as string,
+          record.external_message_id
+        );
+        if (!updateResult.response.ok && updateResult.response.status === 401 && refreshToken) {
+          const refreshed = await refreshTokens();
+          if (refreshed) {
+            updateResult = await updateOutlookMessageRead(
+              accessToken as string,
+              record.external_message_id
+            );
+          }
+        }
+
+        if (!updateResult.response.ok) {
+          await query(`UPDATE email_accounts SET status = 'error' WHERE id = $1`, [
+            record.email_account_id
+          ]);
+        }
+      }
+    }
+
+    await query(`UPDATE emails SET is_unread = false WHERE id = $1`, [record.id]);
+    return res.json({ ok: true, updated: true });
   } catch (err) {
     next(err);
   }
@@ -164,6 +429,37 @@ const fetchOutlookMessages = async (accessToken: string, limit: number) => {
   return { response, data };
 };
 
+const fetchOutlookMessage = async (accessToken: string, messageId: string) => {
+  const url = new URL(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(messageId)}`);
+  url.searchParams.set(
+    '$select',
+    'id,subject,from,toRecipients,ccRecipients,body,bodyPreview,receivedDateTime,isRead'
+  );
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+  const data = await fetchJson(response);
+  return { response, data };
+};
+
+const updateOutlookMessageRead = async (accessToken: string, messageId: string) => {
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(messageId)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ isRead: true })
+    }
+  );
+  const data = await fetchJson(response);
+  return { response, data };
+};
+
 router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
   const accountId =
     typeof req.body?.account_id === 'string'
@@ -186,7 +482,7 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
               p.id AS profile_id
        FROM profiles p
        JOIN email_accounts ea ON ea.id = p.email_account_id
-       WHERE p.user_id = $1 AND p.deleted_at IS NULL AND ea.id = $2
+       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL AND ea.id = $2
        LIMIT 1`,
       [req.currentUser.id, accountId]
     );

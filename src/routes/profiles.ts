@@ -5,6 +5,8 @@ import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+const isAdminOrManager = (roles?: string[] | null) =>
+  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
 
 function parseLimit(value: unknown): number {
   const num = Number(value);
@@ -51,9 +53,11 @@ router.use(authRequired, fetchCurrentUser);
 // 1) List profiles
 router.get('/', async (req, res, next) => {
   const { q, cursor, include_deleted } = req.query || {};
+  const scope = String(req.query?.scope || '').toLowerCase();
+  const allowAll = scope === 'all' && isAdminOrManager(req.currentUser?.roles);
   const limit = parseLimit(req.query?.limit);
-  const filters = ['p.user_id = $1'];
-  const params: Array<string | number | Date | null> = [req.currentUser.id];
+  const filters = allowAll ? ['1=1'] : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)'];
+  const params: Array<string | number | Date | null> = allowAll ? [] : [req.currentUser.id];
   let idx = params.length;
 
   if (!include_deleted || include_deleted === 'false') {
@@ -81,10 +85,28 @@ router.get('/', async (req, res, next) => {
       `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
               rt.title AS resume_template_title,
               p.email_account_id, ea.email_address, ea.status AS email_connection_status,
-              p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+              (SELECT COUNT(1)
+               FROM emails e
+               WHERE e.email_account_id = p.email_account_id
+                 AND e.is_unread) AS unread_count,
+              (SELECT MIN(ce.start_at)
+               FROM calendar_events ce
+               WHERE ce.email_account_id = p.email_account_id
+                 AND ce.start_at >= now()) AS next_interview,
+              p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at,
+              u.username AS owner_username,
+              u.display_name AS owner_display_name,
+              u.email AS owner_email,
+              b.display_name AS assigned_bidder_display_name,
+              b.username AS assigned_bidder_username,
+              b.email AS assigned_bidder_email,
+              ${allowAll ? 'false' : '(p.user_id = $1)'} AS is_owner,
+              ${allowAll ? 'false' : '(p.assigned_bidder_user_id = $1)'} AS is_assigned_to_current_user
        FROM profiles p
+       LEFT JOIN users u ON u.id = p.user_id
        LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
        LEFT JOIN email_accounts ea ON ea.id = p.email_account_id
+       LEFT JOIN users b ON b.id = p.assigned_bidder_user_id
        WHERE ${filters.join(' AND ')}
        ORDER BY p.created_at DESC, p.id DESC
        LIMIT $${params.length + 1}`,
@@ -127,19 +149,38 @@ router.post('/', async (req, res, next) => {
 async function fetchProfileOr404(
   profileId: string,
   includeDeleted: boolean,
-  userId: string
+  userId: string,
+  allowAll = false
 ): Promise<any | null> {
   const { rows } = await query(
     `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
             rt.title AS resume_template_title,
             p.email_account_id, ea.email_address, ea.status AS email_connection_status,
-            p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at
+            (SELECT COUNT(1)
+             FROM emails e
+             WHERE e.email_account_id = p.email_account_id
+               AND e.is_unread) AS unread_count,
+            (SELECT MIN(ce.start_at)
+             FROM calendar_events ce
+             WHERE ce.email_account_id = p.email_account_id
+               AND ce.start_at >= now()) AS next_interview,
+            p.assigned_bidder_user_id, p.assigned_at, p.created_at, p.updated_at, p.deleted_at,
+            u.username AS owner_username,
+            u.display_name AS owner_display_name,
+            u.email AS owner_email,
+            b.display_name AS assigned_bidder_display_name,
+            b.username AS assigned_bidder_username,
+            b.email AS assigned_bidder_email,
+            ${allowAll ? 'false' : '(p.user_id = $2)'} AS is_owner,
+            ${allowAll ? 'false' : '(p.assigned_bidder_user_id = $2)'} AS is_assigned_to_current_user
      FROM profiles p
+     LEFT JOIN users u ON u.id = p.user_id
      LEFT JOIN resume_templates rt ON rt.id = p.resume_template_id
      LEFT JOIN email_accounts ea ON ea.id = p.email_account_id
-     WHERE p.id = $1 AND p.user_id = $2 ${includeDeleted ? '' : 'AND p.deleted_at IS NULL'}
+     LEFT JOIN users b ON b.id = p.assigned_bidder_user_id
+     WHERE p.id = $1 ${allowAll ? '' : 'AND (p.user_id = $2 OR p.assigned_bidder_user_id = $2)'} ${includeDeleted ? '' : 'AND p.deleted_at IS NULL'}
      LIMIT 1`,
-    [profileId, userId]
+    allowAll ? [profileId] : [profileId, userId]
   );
   return rows[0] ?? null;
 }
@@ -147,8 +188,14 @@ async function fetchProfileOr404(
 // 3) Get profile
 router.get('/:profileId', async (req, res, next) => {
   const includeDeleted = req.query?.include_deleted === 'true';
+  const allowAll = isAdminOrManager(req.currentUser?.roles);
   try {
-    const profile = await fetchProfileOr404(req.params.profileId, includeDeleted, req.currentUser.id);
+    const profile = await fetchProfileOr404(
+      req.params.profileId,
+      includeDeleted,
+      req.currentUser.id,
+      allowAll
+    );
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {
@@ -188,15 +235,21 @@ router.patch('/:profileId', async (req, res, next) => {
   }
 
   try {
+    const allowAll = isAdminOrManager(req.currentUser?.roles);
     const { rows } = await query(
       `UPDATE profiles
        SET ${updates.join(', ')}
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'} AND deleted_at IS NULL
        RETURNING id`,
-      [req.params.profileId, req.currentUser.id, ...params]
+      allowAll ? [req.params.profileId, ...params] : [req.params.profileId, req.currentUser.id, ...params]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
-    const updated = await fetchProfileOr404(req.params.profileId, false, req.currentUser.id);
+    const updated = await fetchProfileOr404(
+      req.params.profileId,
+      false,
+      req.currentUser.id,
+      allowAll
+    );
     return res.json(updated);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'duplicate_name' });
@@ -207,11 +260,12 @@ router.patch('/:profileId', async (req, res, next) => {
 // 5) Soft delete profile
 router.delete('/:profileId', async (req, res, next) => {
   try {
+    const allowAll = isAdminOrManager(req.currentUser?.roles);
     const { rowCount } = await query(
       `UPDATE profiles
        SET deleted_at = now(), assigned_bidder_user_id = NULL, assigned_at = NULL
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-      [req.params.profileId, req.currentUser.id]
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'} AND deleted_at IS NULL`,
+      allowAll ? [req.params.profileId] : [req.params.profileId, req.currentUser.id]
     );
     if (rowCount === 0) return res.status(404).json({ error: 'not_found' });
     return res.status(204).send();
@@ -223,9 +277,11 @@ router.delete('/:profileId', async (req, res, next) => {
 async function ensureBidderRole(userId: string): Promise<boolean> {
   const { rows } = await query(
     `SELECT 1
-     FROM user_roles ur
-     JOIN roles r ON r.id = ur.role_id
-     WHERE ur.user_id = $1 AND r.key = 'bidder'
+     FROM talents t
+     JOIN users u ON u.id = COALESCE(t.user_id, t.id)
+     WHERE COALESCE(t.user_id, t.id) = $1
+       AND t.talent_role = 'bidder'
+       AND u.deleted_at IS NULL
      LIMIT 1`,
     [userId]
   );
@@ -235,24 +291,41 @@ async function ensureBidderRole(userId: string): Promise<boolean> {
 async function updateAssignment(
   profileId: string,
   userId: string,
-  bidderUserId: string | null
+  bidderUserId: string | null,
+  allowAll = false
 ): Promise<any | null> {
   const setClause = bidderUserId
-    ? 'assigned_bidder_user_id = $3, assigned_at = now()'
+    ? allowAll
+      ? 'assigned_bidder_user_id = $2, assigned_at = now()'
+      : 'assigned_bidder_user_id = $3, assigned_at = now()'
     : 'assigned_bidder_user_id = NULL, assigned_at = NULL';
 
-  const params = bidderUserId ? [profileId, userId, bidderUserId] : [profileId, userId];
+  const params = allowAll
+    ? bidderUserId
+      ? [profileId, bidderUserId]
+      : [profileId]
+    : bidderUserId
+      ? [profileId, userId, bidderUserId]
+      : [profileId, userId];
 
   const { rows } = await query(
     `UPDATE profiles
      SET ${setClause}
-     WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+     WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'} AND deleted_at IS NULL
      RETURNING id`,
     params
   );
   const updatedId = rows[0]?.id;
   if (!updatedId) return null;
-  return fetchProfileOr404(updatedId, false, userId);
+
+  await query(
+    `UPDATE calendar_events
+     SET assigned_user_id = $2
+     WHERE profile_id = $1`,
+    [updatedId, bidderUserId]
+  );
+
+  return fetchProfileOr404(updatedId, false, userId, allowAll);
 }
 
 // 6) Assign bidder
@@ -264,7 +337,13 @@ router.post('/:profileId/assign-bidder', async (req, res, next) => {
     const hasRole = await ensureBidderRole(bidder_user_id);
     if (!hasRole) return res.status(400).json({ error: 'bidder_user_missing_role' });
 
-    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, bidder_user_id);
+    const allowAll = isAdminOrManager(req.currentUser?.roles);
+    const profile = await updateAssignment(
+      req.params.profileId,
+      req.currentUser.id,
+      bidder_user_id,
+      allowAll
+    );
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {
@@ -275,7 +354,8 @@ router.post('/:profileId/assign-bidder', async (req, res, next) => {
 // 7) Unassign bidder
 router.post('/:profileId/unassign-bidder', async (req, res, next) => {
   try {
-    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null);
+    const allowAll = isAdminOrManager(req.currentUser?.roles);
+    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null, allowAll);
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {

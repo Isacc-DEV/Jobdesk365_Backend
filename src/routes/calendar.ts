@@ -4,6 +4,66 @@ import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+const isAdminOrManager = (roles?: string[] | null) =>
+  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+let calendarSchemaPromise: Promise<void> | null = null;
+
+const ensureCalendarSchema = async () => {
+  if (calendarSchemaPromise) return calendarSchemaPromise;
+  calendarSchemaPromise = (async () => {
+    await query('CREATE EXTENSION IF NOT EXISTS "pgcrypto"');
+    await query(`
+      CREATE TABLE IF NOT EXISTS calendar_events (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        email_account_id uuid NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
+        profile_id uuid REFERENCES profiles(id) ON DELETE SET NULL,
+        assigned_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+        external_event_id text NOT NULL,
+        title text,
+        start_at timestamptz,
+        end_at timestamptz,
+        synced_at timestamptz,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT calendar_events_external_event_id_unique UNIQUE (external_event_id)
+      )
+    `);
+    await query(`
+      ALTER TABLE calendar_events
+      ADD COLUMN IF NOT EXISTS assigned_user_id uuid
+    `);
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints
+          WHERE constraint_name = 'calendar_events_assigned_user_fk'
+            AND table_name = 'calendar_events'
+        ) THEN
+          ALTER TABLE calendar_events
+          ADD CONSTRAINT calendar_events_assigned_user_fk
+          FOREIGN KEY (assigned_user_id)
+          REFERENCES users(id)
+          ON DELETE SET NULL;
+        END IF;
+      END
+      $$;
+    `);
+    await query(
+      `CREATE INDEX IF NOT EXISTS idx_calendar_events_assigned_user_id ON calendar_events (assigned_user_id)`
+    );
+  })();
+
+  try {
+    await calendarSchemaPromise;
+  } catch (err) {
+    calendarSchemaPromise = null;
+    throw err;
+  }
+
+  return calendarSchemaPromise;
+};
 
 function parseLimit(value: unknown): number {
   const num = Number(value);
@@ -62,22 +122,38 @@ const fetchOutlookEvents = async (accessToken: string, start: Date, end: Date, l
   return { response, data };
 };
 
+router.use(async (_req, _res, next) => {
+  try {
+    await ensureCalendarSchema();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) => {
   try {
+    const allowAll = isAdminOrManager(req.currentUser?.roles);
+    const filters = allowAll ? ['p.deleted_at IS NULL'] : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)', 'p.deleted_at IS NULL'];
+    const params: Array<string> = allowAll ? [] : [req.currentUser.id];
     const { rows } = await query(
       `SELECT p.id AS profile_id,
               p.name AS profile_name,
+              u.username AS owner_username,
+              u.display_name AS owner_display_name,
+              u.email AS owner_email,
               p.email_account_id,
               ea.email_address,
               ea.status,
               COUNT(ce.id) AS event_count
        FROM profiles p
+       LEFT JOIN users u ON u.id = p.user_id
        JOIN email_accounts ea ON ea.id = p.email_account_id
        LEFT JOIN calendar_events ce ON ce.email_account_id = p.email_account_id
-       WHERE p.user_id = $1 AND p.deleted_at IS NULL
-       GROUP BY p.id, ea.id
+       WHERE ${filters.join(' AND ')}
+       GROUP BY p.id, ea.id, u.username, u.display_name, u.email
        ORDER BY p.created_at DESC`,
-      [req.currentUser.id]
+      params
     );
     return res.json({ items: rows });
   } catch (err) {
@@ -94,12 +170,11 @@ router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => 
   const start = parseDate(req.query?.start);
   const end = parseDate(req.query?.end);
 
-  const filters = [
-    'p.user_id = $1',
-    'p.deleted_at IS NULL',
-    'ce.email_account_id = $2'
-  ];
-  const params: Array<string | number | Date> = [req.currentUser.id, accountId];
+  const allowAll = isAdminOrManager(req.currentUser?.roles);
+  const filters = allowAll
+    ? ['p.deleted_at IS NULL', 'ce.email_account_id = $1']
+    : ['(p.user_id = $1 OR ce.assigned_user_id = $1)', 'p.deleted_at IS NULL', 'ce.email_account_id = $2'];
+  const params: Array<string | number | Date> = allowAll ? [accountId] : [req.currentUser.id, accountId];
   let idx = params.length;
 
   if (start) {
@@ -119,7 +194,8 @@ router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => 
               ce.email_account_id,
               ce.title,
               ce.start_at,
-              ce.end_at
+              ce.end_at,
+              ce.assigned_user_id
        FROM calendar_events ce
        JOIN profiles p ON p.email_account_id = ce.email_account_id
        WHERE ${filters.join(' AND ')}
@@ -128,6 +204,43 @@ router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => 
       [...params, limit]
     );
     return res.json({ items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, async (req, res, next) => {
+  if (!isAdminOrManager(req.currentUser?.roles)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const eventId = req.params.eventId;
+  const assigneeRaw = req.body?.assignee_user_id;
+  const assigneeId = assigneeRaw ? String(assigneeRaw) : null;
+
+  try {
+    if (assigneeId) {
+      const { rows } = await query(
+        `SELECT 1
+         FROM talents t
+         WHERE COALESCE(t.user_id, t.id) = $1
+           AND t.talent_role = 'caller'
+         LIMIT 1`,
+        [assigneeId]
+      );
+      if (!rows.length) {
+        return res.status(400).json({ error: 'assignee_not_caller' });
+      }
+    }
+
+    const { rows } = await query(
+      `UPDATE calendar_events
+       SET assigned_user_id = $2
+       WHERE id = $1
+       RETURNING id, email_account_id, title, start_at, end_at, assigned_user_id`,
+      [eventId, assigneeId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+    return res.json(rows[0]);
   } catch (err) {
     next(err);
   }
@@ -146,6 +259,7 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
   const limit = parseLimit(req.body?.limit ?? req.query?.limit);
   const start = parseDate(req.body?.start ?? req.query?.start) ?? new Date(Date.now() - 7 * 864e5);
   const end = parseDate(req.body?.end ?? req.query?.end) ?? new Date(Date.now() + 60 * 864e5);
+  const allowAll = isAdminOrManager(req.currentUser?.roles);
 
   try {
     const { rows } = await query(
@@ -154,12 +268,14 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
               ea.access_token,
               ea.refresh_token,
               ea.token_expires_at,
-              p.id AS profile_id
+              p.id AS profile_id,
+              p.assigned_bidder_user_id
        FROM profiles p
        JOIN email_accounts ea ON ea.id = p.email_account_id
-       WHERE p.user_id = $1 AND p.deleted_at IS NULL AND ea.id = $2
+       WHERE ${allowAll ? 'p.deleted_at IS NULL' : '(p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL'}
+         AND ea.id = ${allowAll ? '$1' : '$2'}
        LIMIT 1`,
-      [req.currentUser.id, accountId]
+      allowAll ? [accountId] : [req.currentUser.id, accountId]
     );
 
     if (rows.length === 0) {
@@ -249,13 +365,14 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
       const params: Array<string | Date | null> = [];
 
       events.forEach((event: any, index: number) => {
-        const offset = index * 7;
+        const offset = index * 8;
         values.push(
-          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`
+          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`
         );
         params.push(
           accountId,
           account.profile_id,
+          account.assigned_bidder_user_id ?? null,
           event.id,
           event.subject ?? null,
           event.start?.dateTime ? new Date(event.start.dateTime) : null,
@@ -266,7 +383,7 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
 
       const result = await query(
         `INSERT INTO calendar_events
-         (email_account_id, profile_id, external_event_id, title, start_at, end_at, synced_at)
+         (email_account_id, profile_id, assigned_user_id, external_event_id, title, start_at, end_at, synced_at)
          VALUES ${values.join(', ')}
          ON CONFLICT (external_event_id)
          DO UPDATE SET
@@ -274,7 +391,8 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
            start_at = EXCLUDED.start_at,
            end_at = EXCLUDED.end_at,
            synced_at = EXCLUDED.synced_at,
-           profile_id = EXCLUDED.profile_id
+           profile_id = EXCLUDED.profile_id,
+           assigned_user_id = EXCLUDED.assigned_user_id
          WHERE calendar_events.email_account_id = EXCLUDED.email_account_id
          RETURNING id`,
         params

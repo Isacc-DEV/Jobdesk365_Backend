@@ -14,6 +14,9 @@ type CurrentUser = {
   photo_link: string | null;
   plan: string;
   verified: boolean;
+  last_login_at: string | Date | null;
+  last_login_place: string | null;
+  roles: string[];
   created_at: string | Date;
   updated_at: string | Date;
 };
@@ -38,7 +41,24 @@ export async function fetchCurrentUser(req: Request, res: Response, next: NextFu
   if (!req.user?.id) return res.status(401).json({ error: 'invalid_token' });
   try {
     const { rows } = await query<CurrentUser>(
-      `SELECT id, email, username, display_name, bio, photo_link, plan, verified, created_at, updated_at
+      `SELECT id,
+              email,
+              username,
+              display_name,
+              bio,
+              photo_link,
+              plan,
+              verified,
+              last_login_at,
+              last_login_place,
+              ARRAY(
+                SELECT r.key
+                FROM user_roles ur
+                JOIN roles r ON r.id = ur.role_id
+                WHERE ur.user_id = users.id
+              ) AS roles,
+              created_at,
+              updated_at
        FROM users WHERE id = $1 AND deleted_at IS NULL`,
       [req.user.id]
     );

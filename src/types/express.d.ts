@@ -17,6 +17,9 @@ declare global {
         photo_link: string | null;
         plan: string;
         verified: boolean;
+        last_login_at: string | Date | null;
+        last_login_place: string | null;
+        roles: string[];
         created_at: string | Date;
         updated_at: string | Date;
       };

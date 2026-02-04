@@ -62,6 +62,11 @@ export type Config = {
     redirectUri: string;
     scopes: string[];
   };
+  openai: {
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+  };
 };
 
 export const config: Config = {
@@ -89,5 +94,10 @@ export const config: Config = {
     tenantId: process.env.MS_TENANT_ID || 'common',
     redirectUri: process.env.MS_REDIRECT_URI || 'http://localhost:4000/email/outlook/callback',
     scopes: outlookScopes
+  },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY || '',
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
   }
 };
