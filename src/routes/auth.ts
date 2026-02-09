@@ -49,6 +49,7 @@ type UserRow = UserTokenData & {
   display_name: string | null;
   bio: string | null;
   photo_link: string | null;
+  balance?: number;
   verified: boolean;
   last_login_at?: string | Date | null;
   last_login_place?: string | null;
@@ -88,7 +89,7 @@ router.post('/register', async (req, res, next) => {
     const { rows } = await query<UserRow>(
       `INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan)
        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::plan_type, 'free'::plan_type))
-       RETURNING id, email, username, display_name, bio, photo_link, plan, verified, created_at, updated_at`,
+       RETURNING id, email, username, display_name, bio, photo_link, plan, balance, verified, created_at, updated_at`,
       [email, username, password_hash, display_name ?? null, bio ?? null, photo_link ?? null, plan]
     );
     const user = rows[0];
@@ -110,7 +111,7 @@ router.post('/login', async (req, res, next) => {
   if (!email || !password) return res.status(400).json({ error: 'missing_credentials' });
   try {
     const { rows } = await query<UserRow>(
-      `SELECT id, email, username, password_hash, display_name, bio, photo_link, plan, verified, deleted_at
+      `SELECT id, email, username, password_hash, display_name, bio, photo_link, plan, balance, verified, deleted_at
        FROM users
        WHERE lower(email) = lower($1::text)
        ORDER BY deleted_at NULLS FIRST
@@ -218,7 +219,7 @@ router.put('/me', authRequired, fetchCurrentUser, async (req, res, next) => {
            bio = $2,
            photo_link = $3
        WHERE id = $4
-       RETURNING id, email, username, display_name, bio, photo_link, plan, verified, created_at, updated_at`,
+       RETURNING id, email, username, display_name, bio, photo_link, plan, balance, verified, created_at, updated_at`,
       [displayName ?? null, bio ?? null, photoLink ?? null, req.currentUser.id]
     );
     const user = rows[0];

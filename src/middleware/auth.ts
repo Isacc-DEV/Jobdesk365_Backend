@@ -13,6 +13,7 @@ type CurrentUser = {
   bio: string | null;
   photo_link: string | null;
   plan: string;
+  balance: number;
   verified: boolean;
   last_login_at: string | Date | null;
   last_login_place: string | null;
@@ -48,6 +49,7 @@ export async function fetchCurrentUser(req: Request, res: Response, next: NextFu
               bio,
               photo_link,
               plan,
+              balance,
               verified,
               last_login_at,
               last_login_place,

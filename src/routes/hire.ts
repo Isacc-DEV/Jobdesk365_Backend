@@ -3,6 +3,33 @@ import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+type RouteScope = 'user' | 'manager' | 'admin';
+
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
+
+const getRouteScope = (baseUrl: string | undefined): RouteScope => {
+  if (!baseUrl) return 'user';
+  if (baseUrl.startsWith('/admin/')) return 'admin';
+  if (baseUrl.startsWith('/manager/')) return 'manager';
+  return 'user';
+};
+
+const getScopeContext = (req: express.Request) => {
+  const scope = getRouteScope(req.baseUrl);
+  return { scope, allowAll: scope !== 'user' };
+};
+
+const requireScopeAccess: express.RequestHandler = (req, res, next) => {
+  const scope = getRouteScope(req.baseUrl);
+  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+    return res.status(403).json({ error: 'admin_required' });
+  }
+  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+    return res.status(403).json({ error: 'manager_required' });
+  }
+  return next();
+};
 
 let hireSchemaPromise: Promise<void> | null = null;
 
@@ -305,6 +332,7 @@ const ensureHireSchema = async () => {
 };
 
 router.use(authRequired, fetchCurrentUser);
+router.use(requireScopeAccess);
 router.use(async (_req, _res, next) => {
   try {
     await ensureHireSchema();
@@ -313,9 +341,6 @@ router.use(async (_req, _res, next) => {
     next(err);
   }
 });
-
-const isAdminOrManager = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
 
 const formatRole = (value?: string) => {
   if (!value) return null;
@@ -401,7 +426,8 @@ router.get('/talents', listTalents);
 router.get('/people', listTalents);
 
 router.get('/users', async (req, res, next) => {
-  if (!isAdminOrManager(req.currentUser?.roles)) {
+  const { allowAll } = getScopeContext(req);
+  if (!allowAll) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const q = typeof req.query?.q === 'string' ? req.query.q.trim() : '';
@@ -423,7 +449,8 @@ router.get('/users', async (req, res, next) => {
 });
 
 router.post('/talents', async (req, res, next) => {
-  if (!isAdminOrManager(req.currentUser?.roles)) {
+  const { allowAll } = getScopeContext(req);
+  if (!allowAll) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const payload = req.body || {};
@@ -468,14 +495,27 @@ router.post('/talents', async (req, res, next) => {
     const resolvedEmail = payload.email ?? userRow.email ?? null;
 
     const { rows: roleRows } = await query(
-      `SELECT id FROM roles WHERE key = 'worker' LIMIT 1`
+      `SELECT id, key FROM roles WHERE key IN ('client', 'worker')`
     );
-    if (roleRows.length) {
+    const roleIds = roleRows.reduce<Record<string, string>>((acc, row) => {
+      acc[row.key] = row.id;
+      return acc;
+    }, {});
+
+    if (roleIds.client) {
+      await query(
+        `DELETE FROM user_roles
+         WHERE user_id = $1 AND role_id = $2`,
+        [userId, roleIds.client]
+      );
+    }
+
+    if (roleIds.worker) {
       await query(
         `INSERT INTO user_roles (user_id, role_id)
          VALUES ($1, $2)
          ON CONFLICT DO NOTHING`,
-        [userId, roleRows[0].id]
+        [userId, roleIds.worker]
       );
     }
 
@@ -520,9 +560,8 @@ router.post('/talents', async (req, res, next) => {
 
 router.get('/requests', async (req, res, next) => {
   const status = formatStatus(String(req.query?.status || ''));
-  const scope = String(req.query?.scope || '').toLowerCase();
-  const allowAll = scope === 'all' && isAdminOrManager(req.currentUser?.roles);
-  const filters = allowAll ? ['1=1'] : ['r.user_id = $1'];
+  const { allowAll } = getScopeContext(req);
+  const filters = allowAll ? ['1=1'] : ['(r.user_id = $1 OR r.assignee_user_id = $1)'];
   const params: Array<string> = allowAll ? [] : [req.currentUser.id];
   let idx = params.length;
 
@@ -615,8 +654,8 @@ router.post('/requests', async (req, res, next) => {
 router.patch('/requests/:requestId', async (req, res, next) => {
   const payload = req.body || {};
   const updates: string[] = [];
-  const isAdmin = isAdminOrManager(req.currentUser?.roles);
-  const params: Array<unknown> = isAdmin ? [req.params.requestId] : [req.params.requestId, req.currentUser.id];
+  const { allowAll } = getScopeContext(req);
+  const params: Array<unknown> = allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id];
   let idx = params.length;
 
   const addField = (column: string, value: unknown) => {
@@ -645,8 +684,8 @@ router.patch('/requests/:requestId', async (req, res, next) => {
 
     if (!effectiveRole && nextAssigneeId) {
       const roleResult = await query(
-        `SELECT role FROM requests WHERE id = $1 ${isAdmin ? '' : 'AND user_id = $2'}`,
-        isAdmin ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
+        `SELECT role FROM requests WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
+        allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
       );
       if (!roleResult.rows.length) return res.status(404).json({ error: 'not_found' });
       effectiveRole = roleResult.rows[0].role;
@@ -680,8 +719,8 @@ router.patch('/requests/:requestId', async (req, res, next) => {
     let effectiveRole = payload.role ? formatRole(payload.role) : null;
     if (!effectiveRole) {
       const roleResult = await query(
-        `SELECT role FROM requests WHERE id = $1 ${isAdmin ? '' : 'AND user_id = $2'}`,
-        isAdmin ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
+        `SELECT role FROM requests WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
+        allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
       );
       if (!roleResult.rows.length) return res.status(404).json({ error: 'not_found' });
       effectiveRole = roleResult.rows[0].role;
@@ -703,7 +742,7 @@ router.patch('/requests/:requestId', async (req, res, next) => {
     const { rows } = await query(
       `UPDATE requests
        SET ${updates.join(', ')}
-       WHERE id = $1 ${isAdmin ? '' : 'AND user_id = $2'}
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}
        RETURNING *`,
       params
     );
@@ -715,12 +754,12 @@ router.patch('/requests/:requestId', async (req, res, next) => {
 });
 
 router.delete('/requests/:requestId', async (req, res, next) => {
-  const isAdmin = isAdminOrManager(req.currentUser?.roles);
+  const { allowAll } = getScopeContext(req);
   try {
     const { rowCount } = await query(
       `DELETE FROM requests
-       WHERE id = $1 ${isAdmin ? '' : 'AND user_id = $2'}`,
-      isAdmin ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
+      allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
     );
     if (!rowCount) return res.status(404).json({ error: 'not_found' });
     return res.status(204).send();

@@ -4,9 +4,10 @@ import { query } from '../db.js';
 import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
-const router = express.Router();
-const isAdminOrManager = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+type ProfilesAccessMode = 'user' | 'manager' | 'admin';
+
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
 
 function parseLimit(value: unknown): number {
   const num = Number(value);
@@ -48,13 +49,24 @@ function buildOutlookAuthorizeUrl(state: string): string {
   return `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
 }
 
-router.use(authRequired, fetchCurrentUser);
+const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
+  const router = express.Router();
+  const allowAll = mode !== 'user';
 
-// 1) List profiles
-router.get('/', async (req, res, next) => {
+  router.use(authRequired, fetchCurrentUser);
+  router.use((req, res, next) => {
+    if (mode === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+      return res.status(403).json({ error: 'admin_required' });
+    }
+    if (mode === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+      return res.status(403).json({ error: 'manager_required' });
+    }
+    return next();
+  });
+
+  // 1) List profiles
+  router.get('/', async (req, res, next) => {
   const { q, cursor, include_deleted } = req.query || {};
-  const scope = String(req.query?.scope || '').toLowerCase();
-  const allowAll = scope === 'all' && isAdminOrManager(req.currentUser?.roles);
   const limit = parseLimit(req.query?.limit);
   const filters = allowAll ? ['1=1'] : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)'];
   const params: Array<string | number | Date | null> = allowAll ? [] : [req.currentUser.id];
@@ -119,10 +131,10 @@ router.get('/', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+  });
 
-// 2) Create profile
-router.post('/', async (req, res, next) => {
+  // 2) Create profile
+  router.post('/', async (req, res, next) => {
   const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
   if (!name || !resume_template_id) {
     return res.status(400).json({ error: 'missing_required_fields' });
@@ -144,14 +156,13 @@ router.post('/', async (req, res, next) => {
     }
     next(err);
   }
-});
+  });
 
-async function fetchProfileOr404(
-  profileId: string,
-  includeDeleted: boolean,
-  userId: string,
-  allowAll = false
-): Promise<any | null> {
+  async function fetchProfileOr404(
+    profileId: string,
+    includeDeleted: boolean,
+    userId: string
+  ): Promise<any | null> {
   const { rows } = await query(
     `SELECT p.id, p.user_id, p.name, p.description, p.base_info, p.base_resume, p.resume_template_id,
             rt.title AS resume_template_title,
@@ -183,28 +194,26 @@ async function fetchProfileOr404(
     allowAll ? [profileId] : [profileId, userId]
   );
   return rows[0] ?? null;
-}
+  }
 
-// 3) Get profile
-router.get('/:profileId', async (req, res, next) => {
+  // 3) Get profile
+  router.get('/:profileId', async (req, res, next) => {
   const includeDeleted = req.query?.include_deleted === 'true';
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
   try {
     const profile = await fetchProfileOr404(
       req.params.profileId,
       includeDeleted,
-      req.currentUser.id,
-      allowAll
+      req.currentUser.id
     );
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {
     next(err);
   }
-});
+  });
 
-// 4) Update profile
-router.patch('/:profileId', async (req, res, next) => {
+  // 4) Update profile
+  router.patch('/:profileId', async (req, res, next) => {
   const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
   const updates = [];
   const params = [];
@@ -235,7 +244,6 @@ router.patch('/:profileId', async (req, res, next) => {
   }
 
   try {
-    const allowAll = isAdminOrManager(req.currentUser?.roles);
     const { rows } = await query(
       `UPDATE profiles
        SET ${updates.join(', ')}
@@ -247,20 +255,18 @@ router.patch('/:profileId', async (req, res, next) => {
     const updated = await fetchProfileOr404(
       req.params.profileId,
       false,
-      req.currentUser.id,
-      allowAll
+      req.currentUser.id
     );
     return res.json(updated);
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'duplicate_name' });
     next(err);
   }
-});
+  });
 
-// 5) Soft delete profile
-router.delete('/:profileId', async (req, res, next) => {
+  // 5) Soft delete profile
+  router.delete('/:profileId', async (req, res, next) => {
   try {
-    const allowAll = isAdminOrManager(req.currentUser?.roles);
     const { rowCount } = await query(
       `UPDATE profiles
        SET deleted_at = now(), assigned_bidder_user_id = NULL, assigned_at = NULL
@@ -272,9 +278,9 @@ router.delete('/:profileId', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+  });
 
-async function ensureBidderRole(userId: string): Promise<boolean> {
+  async function ensureBidderRole(userId: string): Promise<boolean> {
   const { rows } = await query(
     `SELECT 1
      FROM talents t
@@ -286,14 +292,13 @@ async function ensureBidderRole(userId: string): Promise<boolean> {
     [userId]
   );
   return rows.length > 0;
-}
+  }
 
-async function updateAssignment(
-  profileId: string,
-  userId: string,
-  bidderUserId: string | null,
-  allowAll = false
-): Promise<any | null> {
+  async function updateAssignment(
+    profileId: string,
+    userId: string,
+    bidderUserId: string | null
+  ): Promise<any | null> {
   const setClause = bidderUserId
     ? allowAll
       ? 'assigned_bidder_user_id = $2, assigned_at = now()'
@@ -325,11 +330,11 @@ async function updateAssignment(
     [updatedId, bidderUserId]
   );
 
-  return fetchProfileOr404(updatedId, false, userId, allowAll);
-}
+  return fetchProfileOr404(updatedId, false, userId);
+  }
 
-// 6) Assign bidder
-router.post('/:profileId/assign-bidder', async (req, res, next) => {
+  // 6) Assign bidder
+  router.post('/:profileId/assign-bidder', async (req, res, next) => {
   const { bidder_user_id } = req.body || {};
   if (!bidder_user_id) return res.status(400).json({ error: 'missing_bidder_user_id' });
 
@@ -337,34 +342,31 @@ router.post('/:profileId/assign-bidder', async (req, res, next) => {
     const hasRole = await ensureBidderRole(bidder_user_id);
     if (!hasRole) return res.status(400).json({ error: 'bidder_user_missing_role' });
 
-    const allowAll = isAdminOrManager(req.currentUser?.roles);
     const profile = await updateAssignment(
       req.params.profileId,
       req.currentUser.id,
-      bidder_user_id,
-      allowAll
+      bidder_user_id
     );
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {
     next(err);
   }
-});
+  });
 
-// 7) Unassign bidder
-router.post('/:profileId/unassign-bidder', async (req, res, next) => {
+  // 7) Unassign bidder
+  router.post('/:profileId/unassign-bidder', async (req, res, next) => {
   try {
-    const allowAll = isAdminOrManager(req.currentUser?.roles);
-    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null, allowAll);
+    const profile = await updateAssignment(req.params.profileId, req.currentUser.id, null);
     if (!profile) return res.status(404).json({ error: 'not_found' });
     return res.json(profile);
   } catch (err) {
     next(err);
   }
-});
+  });
 
-// 8) Start Outlook email connection
-router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
+  // 8) Start Outlook email connection
+  router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
   if (!isOutlookConfigured()) {
     return res.status(503).json({ error: 'outlook_not_configured' });
   }
@@ -394,6 +396,10 @@ router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+  });
 
-export default router;
+  return router;
+};
+
+export { createProfilesRouter };
+export default createProfilesRouter();

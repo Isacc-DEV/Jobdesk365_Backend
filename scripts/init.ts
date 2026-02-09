@@ -139,6 +139,7 @@ async function applySchema() {
         bio text,
         photo_link text,
         plan plan_type NOT NULL DEFAULT 'free'::plan_type,
+        balance numeric(12, 2) NOT NULL DEFAULT 1,
         verified boolean NOT NULL DEFAULT false,
         last_login_at timestamptz,
         last_login_place text,
@@ -148,15 +149,26 @@ async function applySchema() {
       )
     `);
 
-    await client.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS last_login_at timestamptz
-    `);
+      await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS last_login_at timestamptz
+      `);
 
-    await client.query(`
-      ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS last_login_place text
-    `);
+      await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS last_login_place text
+      `);
+
+      await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS balance numeric(12, 2) NOT NULL DEFAULT 1
+      `);
+
+      await client.query(`
+        UPDATE users
+        SET balance = 1
+        WHERE balance IS NULL
+      `);
 
     await client.query(`
       DROP TRIGGER IF EXISTS trg_users_updated_at ON users;
@@ -515,11 +527,11 @@ async function applySchema() {
       `
     );
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS dynamic_questions (
-        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        question_text text NOT NULL,
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS dynamic_questions (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          question_text text NOT NULL,
         field_type text NOT NULL DEFAULT 'text',
         options jsonb DEFAULT NULL,
         is_required boolean DEFAULT false,
@@ -527,7 +539,268 @@ async function applySchema() {
         created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now()
       )
-    `);
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_threads (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+          guest_id text,
+          user_type text NOT NULL CHECK (user_type IN ('client', 'guest')),
+          display_name text,
+          status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'assigned', 'waiting', 'closed')),
+          assigned_manager_id uuid REFERENCES users(id) ON DELETE SET NULL,
+          watchers jsonb NOT NULL DEFAULT '[]'::jsonb,
+          last_activity_at timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          closed_at timestamptz
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_channels (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          key text NOT NULL UNIQUE,
+          name text NOT NULL,
+          position integer NOT NULL DEFAULT 0,
+          is_support boolean NOT NULL DEFAULT false,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_channel_messages (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          channel_id uuid NOT NULL REFERENCES chat_channels(id) ON DELETE CASCADE,
+          sender_id uuid REFERENCES users(id) ON DELETE SET NULL,
+          content text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_channel_reactions (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_channel_messages(id) ON DELETE CASCADE,
+          user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          emoji text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_dm_threads (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_a_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          user_b_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_dm_messages (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          thread_id uuid NOT NULL REFERENCES chat_dm_threads(id) ON DELETE CASCADE,
+          sender_id uuid REFERENCES users(id) ON DELETE SET NULL,
+          content text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_dm_reactions (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_dm_messages(id) ON DELETE CASCADE,
+          user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          emoji text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          thread_id uuid NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+          sender_type text NOT NULL CHECK (sender_type IN ('system', 'internal', 'external')),
+          sender_id uuid REFERENCES users(id) ON DELETE SET NULL,
+          content text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          delivered_at timestamptz,
+          read_at timestamptz
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_message_reads (
+          message_id uuid NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+          user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          read_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (message_id, user_id)
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_reactions (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+          user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+          guest_id text,
+          emoji text NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_attachments (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+          file_url text NOT NULL,
+          file_type text,
+          preview_url text,
+          size_bytes integer,
+          name text,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_channel_attachments (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_channel_messages(id) ON DELETE CASCADE,
+          file_url text NOT NULL,
+          file_type text,
+          preview_url text,
+          size_bytes integer,
+          name text,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS chat_dm_attachments (
+          id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+          message_id uuid NOT NULL REFERENCES chat_dm_messages(id) ON DELETE CASCADE,
+          file_url text NOT NULL,
+          file_type text,
+          preview_url text,
+          size_bytes integer,
+          name text,
+          created_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reactions_user_unique
+        ON chat_reactions (message_id, user_id, emoji)
+        WHERE user_id IS NOT NULL
+      `);
+
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_reactions_guest_unique
+        ON chat_reactions (message_id, guest_id, emoji)
+        WHERE guest_id IS NOT NULL
+      `);
+
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS idx_chat_channel_attachments_message_id
+         ON chat_channel_attachments (message_id)`
+      );
+
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS idx_chat_dm_attachments_message_id
+         ON chat_dm_attachments (message_id)`
+      );
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_threads_user_id ON chat_threads (user_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_threads_guest_id ON chat_threads (guest_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_threads_status ON chat_threads (status)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_threads_assigned_manager_id ON chat_threads (assigned_manager_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_threads_last_activity ON chat_threads (last_activity_at DESC)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_channels_position ON chat_channels (position)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_channel_messages_channel_id ON chat_channel_messages (channel_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_channel_messages_created_at ON chat_channel_messages (created_at DESC)
+      `);
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_channel_reactions_user_unique
+        ON chat_channel_reactions (message_id, user_id, emoji)
+      `);
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_dm_threads_unique_pair
+        ON chat_dm_threads (LEAST(user_a_id, user_b_id), GREATEST(user_a_id, user_b_id))
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_dm_messages_thread_id ON chat_dm_messages (thread_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_dm_messages_created_at ON chat_dm_messages (created_at DESC)
+      `);
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_dm_reactions_user_unique
+        ON chat_dm_reactions (message_id, user_id, emoji)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_id ON chat_messages (thread_id)
+      `);
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages (created_at DESC)
+      `);
+
+      await client.query(`
+        INSERT INTO chat_channels (key, name, position, is_support)
+        VALUES
+          ('all_to_the_members', 'all_to_the_members', 0, false),
+          ('issue_report', 'issue_report', 1, false),
+          ('callers_workspace', 'callers_workspace', 2, false),
+          ('bidders_workspace', 'bidders_workspace', 3, false),
+          ('support_workspace', 'support_workspace', 4, true)
+        ON CONFLICT (key) DO UPDATE
+          SET name = EXCLUDED.name,
+              position = EXCLUDED.position,
+              is_support = EXCLUDED.is_support,
+              updated_at = now()
+      `);
+
+      await client.query(`
+        DROP TRIGGER IF EXISTS trg_chat_threads_updated_at ON chat_threads;
+        CREATE TRIGGER trg_chat_threads_updated_at
+        BEFORE UPDATE ON chat_threads
+        FOR EACH ROW
+        EXECUTE FUNCTION set_row_updated_at();
+      `);
+
+      await client.query(`
+        DROP TRIGGER IF EXISTS trg_chat_channels_updated_at ON chat_channels;
+        CREATE TRIGGER trg_chat_channels_updated_at
+        BEFORE UPDATE ON chat_channels
+        FOR EACH ROW
+        EXECUTE FUNCTION set_row_updated_at();
+      `);
+
+      await client.query(`
+        DROP TRIGGER IF EXISTS trg_chat_dm_threads_updated_at ON chat_dm_threads;
+        CREATE TRIGGER trg_chat_dm_threads_updated_at
+        BEFORE UPDATE ON chat_dm_threads
+        FOR EACH ROW
+        EXECUTE FUNCTION set_row_updated_at();
+      `);
 
     await client.query(`
       DROP TRIGGER IF EXISTS trg_dynamic_questions_updated_at ON dynamic_questions;

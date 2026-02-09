@@ -1,8 +1,9 @@
 import express from 'express';
-import { query } from '../db.js';
+import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+const APPLICATION_COST = 0.08;
 
 const DEFAULT_SUCCESS_LABELS = [
   'thank you for applying',
@@ -1102,9 +1103,29 @@ const upsertApplication = async (req, res, next) => {
   if (!url || !bid_entry) {
     return res.status(400).json({ error: 'missing_bid_entry' });
   }
+  const profileId = bid_entry?.profile_id;
+  if (!profileId) {
+    return res.status(400).json({ error: 'missing_profile_id' });
+  }
 
+  const client = await getClient();
   try {
-    const existing = await query(
+    await client.query('BEGIN');
+
+    const { rows: profileRows } = await client.query(
+      `SELECT user_id
+       FROM profiles
+       WHERE id = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [profileId]
+    );
+    if (!profileRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'profile_not_found' });
+    }
+    const ownerId = profileRows[0].user_id;
+
+    const existing = await client.query(
       `SELECT id, bids
        FROM applications
        WHERE user_id = $1 AND url = $2
@@ -1115,30 +1136,90 @@ const upsertApplication = async (req, res, next) => {
     if (existing.rowCount > 0) {
       const row = existing.rows[0];
       const existingBids = Array.isArray(row.bids) ? row.bids : [];
+      const alreadyApplied = existingBids.some(
+        (bid: any) => bid?.profile_id === profileId
+      );
       const updatedBids = existingBids.filter(
-        (bid: any) => bid?.profile_id !== bid_entry.profile_id
+        (bid: any) => bid?.profile_id !== profileId
       );
       updatedBids.push(bid_entry);
 
-      const { rows } = await query(
+      if (!alreadyApplied && APPLICATION_COST > 0) {
+        const { rows: chargeRows } = await client.query(
+          `UPDATE users
+           SET balance = balance - $1
+           WHERE id = $2 AND balance >= $1
+           RETURNING balance`,
+          [APPLICATION_COST, ownerId]
+        );
+        if (!chargeRows.length) {
+          await client.query('ROLLBACK');
+          const { rows: balanceRows } = await query(
+            `SELECT balance FROM users WHERE id = $1`,
+            [ownerId]
+          );
+          const balance = balanceRows[0]?.balance ?? 0;
+          return res.status(402).json({
+            error: 'insufficient_balance',
+            message: 'Insufficient balance to apply.',
+            balance,
+            required: APPLICATION_COST
+          });
+        }
+      }
+
+      const { rows } = await client.query(
         `UPDATE applications
          SET bids = $1::jsonb
          WHERE id = $2
          RETURNING *`,
         [JSON.stringify(updatedBids), row.id]
       );
+      await client.query('COMMIT');
       return res.json(rows[0]);
     }
 
-    const { rows } = await query(
+    if (APPLICATION_COST > 0) {
+      const { rows: chargeRows } = await client.query(
+        `UPDATE users
+         SET balance = balance - $1
+         WHERE id = $2 AND balance >= $1
+         RETURNING balance`,
+        [APPLICATION_COST, ownerId]
+      );
+      if (!chargeRows.length) {
+        await client.query('ROLLBACK');
+        const { rows: balanceRows } = await query(
+          `SELECT balance FROM users WHERE id = $1`,
+          [ownerId]
+        );
+        const balance = balanceRows[0]?.balance ?? 0;
+        return res.status(402).json({
+          error: 'insufficient_balance',
+          message: 'Insufficient balance to apply.',
+          balance,
+          required: APPLICATION_COST
+        });
+      }
+    }
+
+    const { rows } = await client.query(
       `INSERT INTO applications (user_id, url, bids)
        VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
       [req.currentUser.id, url, JSON.stringify([bid_entry])]
     );
+    await client.query('COMMIT');
     res.status(201).json(rows[0]);
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore rollback errors
+    }
     next(err);
+  } finally {
+    client.release();
   }
 };
 

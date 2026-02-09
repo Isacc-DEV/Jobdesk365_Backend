@@ -5,6 +5,33 @@ import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+type RouteScope = 'user' | 'manager' | 'admin';
+
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
+
+const getRouteScope = (baseUrl: string | undefined): RouteScope => {
+  if (!baseUrl) return 'user';
+  if (baseUrl.startsWith('/admin/')) return 'admin';
+  if (baseUrl.startsWith('/manager/')) return 'manager';
+  return 'user';
+};
+
+const getScopeContext = (req: express.Request) => {
+  const scope = getRouteScope(req.baseUrl);
+  return { scope, allowAll: scope !== 'user' };
+};
+
+const requireScopeAccess: express.RequestHandler = (req, res, next) => {
+  const scope = getRouteScope(req.baseUrl);
+  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+    return res.status(403).json({ error: 'admin_required' });
+  }
+  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+    return res.status(403).json({ error: 'manager_required' });
+  }
+  return next();
+};
 
 function parseLimit(value: unknown): number {
   const num = Number(value);
@@ -79,8 +106,13 @@ const fetchJson = async (response: Response): Promise<Record<string, any>> => {
   }
 };
 
-router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.get('/accounts', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   try {
+    const { allowAll } = getScopeContext(req);
+    const filters = allowAll
+      ? ['p.deleted_at IS NULL']
+      : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)', 'p.deleted_at IS NULL'];
+    const params: Array<string> = allowAll ? [] : [req.currentUser.id];
     const { rows } = await query(
       `SELECT p.id AS profile_id,
               p.name AS profile_name,
@@ -91,10 +123,10 @@ router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) =
        FROM profiles p
        JOIN email_accounts ea ON ea.id = p.email_account_id
        LEFT JOIN emails e ON e.email_account_id = p.email_account_id
-       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL
+       WHERE ${filters.join(' AND ')}
        GROUP BY p.id, ea.id
        ORDER BY p.created_at DESC`,
-      [req.currentUser.id]
+      params
     );
     return res.json({ items: rows });
   } catch (err) {
@@ -102,7 +134,7 @@ router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) =
   }
 });
 
-router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.get('/messages', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const accountId = typeof req.query?.account_id === 'string' ? req.query.account_id : null;
   if (!accountId) {
     return res.status(400).json({ error: 'missing_account_id' });
@@ -110,6 +142,13 @@ router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) =
   const limit = parseLimit(req.query?.limit);
 
   try {
+    const { allowAll } = getScopeContext(req);
+    const filters = allowAll
+      ? ['p.deleted_at IS NULL', 'e.email_account_id = $1']
+      : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)', 'p.deleted_at IS NULL', 'e.email_account_id = $2'];
+    const params: Array<string | number> = allowAll
+      ? [accountId, limit]
+      : [req.currentUser.id, accountId, limit];
     const { rows } = await query(
       `SELECT e.id,
               e.email_account_id,
@@ -120,12 +159,10 @@ router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) =
               e.is_unread
        FROM emails e
        JOIN profiles p ON p.email_account_id = e.email_account_id
-       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1)
-         AND p.deleted_at IS NULL
-         AND e.email_account_id = $2
+       WHERE ${filters.join(' AND ')}
        ORDER BY e.received_at DESC NULLS LAST, e.created_at DESC
-       LIMIT $3`,
-      [req.currentUser.id, accountId, limit]
+       LIMIT $${allowAll ? 2 : 3}`,
+      params
     );
     return res.json({ items: rows });
   } catch (err) {
@@ -133,13 +170,14 @@ router.get('/messages', authRequired, fetchCurrentUser, async (req, res, next) =
   }
 });
 
-router.get('/messages/:emailId', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.get('/messages/:emailId', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const emailId = typeof req.params?.emailId === 'string' ? req.params.emailId : null;
   if (!emailId) {
     return res.status(400).json({ error: 'missing_email_id' });
   }
 
   try {
+    const { allowAll } = getScopeContext(req);
     const { rows } = await query(
       `SELECT e.id,
               e.email_account_id,
@@ -158,10 +196,10 @@ router.get('/messages/:emailId', authRequired, fetchCurrentUser, async (req, res
        JOIN email_accounts ea ON ea.id = e.email_account_id
        JOIN profiles p ON p.email_account_id = e.email_account_id
        WHERE e.id = $1
-         AND (p.user_id = $2 OR p.assigned_bidder_user_id = $2)
+         AND ${allowAll ? '1=1' : '(p.user_id = $2 OR p.assigned_bidder_user_id = $2)'}
          AND p.deleted_at IS NULL
        LIMIT 1`,
-      [emailId, req.currentUser.id]
+      allowAll ? [emailId] : [emailId, req.currentUser.id]
     );
 
     if (rows.length === 0) {
@@ -279,13 +317,14 @@ router.get('/messages/:emailId', authRequired, fetchCurrentUser, async (req, res
   }
 });
 
-router.patch('/messages/:emailId/read', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.patch('/messages/:emailId/read', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const emailId = typeof req.params?.emailId === 'string' ? req.params.emailId : null;
   if (!emailId) {
     return res.status(400).json({ error: 'missing_email_id' });
   }
 
   try {
+    const { allowAll } = getScopeContext(req);
     const { rows } = await query(
       `SELECT e.id,
               e.email_account_id,
@@ -299,10 +338,10 @@ router.patch('/messages/:emailId/read', authRequired, fetchCurrentUser, async (r
        JOIN email_accounts ea ON ea.id = e.email_account_id
        JOIN profiles p ON p.email_account_id = e.email_account_id
        WHERE e.id = $1
-         AND (p.user_id = $2 OR p.assigned_bidder_user_id = $2)
+         AND ${allowAll ? '1=1' : '(p.user_id = $2 OR p.assigned_bidder_user_id = $2)'}
          AND p.deleted_at IS NULL
        LIMIT 1`,
-      [emailId, req.currentUser.id]
+      allowAll ? [emailId] : [emailId, req.currentUser.id]
     );
 
     if (rows.length === 0) {
@@ -460,7 +499,7 @@ const updateOutlookMessageRead = async (accessToken: string, messageId: string) 
   return { response, data };
 };
 
-router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.post('/sync', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const accountId =
     typeof req.body?.account_id === 'string'
       ? req.body.account_id
@@ -473,6 +512,7 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
   const limit = parseLimit(req.body?.limit ?? req.query?.limit);
 
   try {
+    const { allowAll } = getScopeContext(req);
     const { rows } = await query(
       `SELECT ea.id,
               ea.provider,
@@ -482,9 +522,9 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
               p.id AS profile_id
        FROM profiles p
        JOIN email_accounts ea ON ea.id = p.email_account_id
-       WHERE (p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL AND ea.id = $2
+       WHERE ${allowAll ? 'p.deleted_at IS NULL AND ea.id = $1' : '(p.user_id = $1 OR p.assigned_bidder_user_id = $1) AND p.deleted_at IS NULL AND ea.id = $2'}
        LIMIT 1`,
-      [req.currentUser.id, accountId]
+      allowAll ? [accountId] : [req.currentUser.id, accountId]
     );
 
     if (rows.length === 0) {

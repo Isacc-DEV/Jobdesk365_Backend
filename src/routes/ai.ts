@@ -4,6 +4,8 @@ import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+const RESUME_GENERATE_COST = 0.04;
+const RESUME_REGENERATE_COST = 0.02;
 
 type OpenAiErrorResponse = {
   error?: {
@@ -190,12 +192,30 @@ router.post('/resume-tailor', async (req, res, next) => {
   }
 
   const { job_description, profile_id } = req.body || {};
+  const regenerate = Boolean(req.body?.regenerate);
   if (!job_description || typeof job_description !== 'string') {
     return res.status(400).json({ error: 'missing_job_description' });
   }
   if (!profile_id || typeof profile_id !== 'string') {
     return res.status(400).json({ error: 'missing_profile_id' });
   }
+
+  let charged = false;
+  let chargeAmount = regenerate ? RESUME_REGENERATE_COST : RESUME_GENERATE_COST;
+  if (!Number.isFinite(chargeAmount) || chargeAmount < 0) chargeAmount = 0;
+  const refundCharge = async () => {
+    if (!charged || chargeAmount <= 0) return;
+    try {
+      await query(
+        `UPDATE users
+         SET balance = balance + $1
+         WHERE id = $2`,
+        [chargeAmount, req.currentUser.id]
+      );
+    } catch {
+      // best-effort refund
+    }
+  };
 
   try {
     const { rows } = await query(
@@ -207,6 +227,30 @@ router.post('/resume-tailor', async (req, res, next) => {
     );
     if (rows.length === 0) {
       return res.status(404).json({ error: 'profile_not_found' });
+    }
+
+    if (chargeAmount > 0) {
+      const { rows: chargeRows } = await query(
+        `UPDATE users
+         SET balance = balance - $1
+         WHERE id = $2 AND balance >= $1
+         RETURNING balance`,
+        [chargeAmount, req.currentUser.id]
+      );
+      if (!chargeRows.length) {
+        const { rows: balanceRows } = await query(
+          `SELECT balance FROM users WHERE id = $1`,
+          [req.currentUser.id]
+        );
+        const balance = balanceRows[0]?.balance ?? 0;
+        return res.status(402).json({
+          error: 'insufficient_balance',
+          message: 'Insufficient balance to generate a resume.',
+          balance,
+          required: chargeAmount
+        });
+      }
+      charged = true;
     }
 
     const baseResume = rows[0]?.base_resume ?? {};
@@ -250,6 +294,7 @@ router.post('/resume-tailor', async (req, res, next) => {
       const errorPayload = payload as OpenAiErrorResponse;
       const message =
         errorPayload?.error?.message || 'OpenAI request failed.';
+      await refundCharge();
       return res.status(response.status).json({ error: 'openai_error', message });
     }
 
@@ -257,6 +302,7 @@ router.post('/resume-tailor', async (req, res, next) => {
     const parsed = parseJsonFromText(content);
 
     if (!parsed) {
+      await refundCharge();
       return res.status(502).json({
         error: 'invalid_ai_response',
         message: 'AI response was not valid JSON.',
@@ -266,6 +312,7 @@ router.post('/resume-tailor', async (req, res, next) => {
 
     return res.json(parsed);
   } catch (err) {
+    await refundCharge();
     return next(err);
   }
 });

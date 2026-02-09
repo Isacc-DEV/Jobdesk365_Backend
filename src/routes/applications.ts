@@ -3,8 +3,23 @@ import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
+type RouteScope = 'user' | 'manager' | 'admin';
 
 let applicationsSchemaPromise: Promise<void> | null = null;
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
+
+const getRouteScope = (baseUrl: string | undefined): RouteScope => {
+  if (!baseUrl) return 'user';
+  if (baseUrl.startsWith('/admin/')) return 'admin';
+  if (baseUrl.startsWith('/manager/')) return 'manager';
+  return 'user';
+};
+
+const getScopeContext = (req: express.Request) => {
+  const scope = getRouteScope(req.baseUrl);
+  return { scope, allowAll: scope !== 'user' };
+};
 
 const ensureApplicationsSchema = async () => {
   if (applicationsSchemaPromise) return applicationsSchemaPromise;
@@ -128,6 +143,16 @@ const getLatestBidTimestamp = (bids: any[]) => {
 };
 
 router.use(authRequired, fetchCurrentUser);
+router.use((req, res, next) => {
+  const scope = getRouteScope(req.baseUrl);
+  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+    return res.status(403).json({ error: 'admin_required' });
+  }
+  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+    return res.status(403).json({ error: 'manager_required' });
+  }
+  return next();
+});
 router.use(async (_req, _res, next) => {
   try {
     await ensureApplicationsSchema();
@@ -141,23 +166,28 @@ router.get('/', async (req, res, next) => {
   const { q, from, to } = req.query || {};
   const fromIso = typeof from === 'string' ? toIsoString(from) : null;
   const toIso = typeof to === 'string' ? toEndOfDayIso(to) : null;
+  const { allowAll } = getScopeContext(req);
 
   try {
-    const { rows: ownedProfiles } = await query(
-      `SELECT id
-       FROM profiles
-       WHERE user_id = $1 AND deleted_at IS NULL`,
-      [req.currentUser.id]
-    );
-    const ownedProfileIds = ownedProfiles.map((row) => row.id).filter(Boolean);
-    const hasOwnedProfiles = ownedProfileIds.length > 0;
+    const params: Array<string | string[]> = [];
+    let whereClause = '1=1';
+    if (!allowAll) {
+      const { rows: visibleProfiles } = await query(
+        `SELECT id
+         FROM profiles
+         WHERE (user_id = $1 OR assigned_bidder_user_id = $1) AND deleted_at IS NULL`,
+        [req.currentUser.id]
+      );
+      const visibleProfileIds = visibleProfiles.map((row) => row.id).filter(Boolean);
+      const hasVisibleProfiles = visibleProfileIds.length > 0;
 
-    const params: Array<string | string[]> = [req.currentUser.id];
-    let whereClause = 'a.user_id = $1';
-    if (hasOwnedProfiles) {
-      params.push(ownedProfileIds);
-      whereClause =
-        `a.user_id = $1 OR EXISTS (SELECT 1 FROM jsonb_array_elements(a.bids) AS bid WHERE bid->>'profile_id' = ANY($2::text[]))`;
+      params.push(req.currentUser.id);
+      whereClause = 'a.user_id = $1';
+      if (hasVisibleProfiles) {
+        params.push(visibleProfileIds);
+        whereClause =
+          `a.user_id = $1 OR EXISTS (SELECT 1 FROM jsonb_array_elements(a.bids) AS bid WHERE bid->>'profile_id' = ANY($2::text[]))`;
+      }
     }
 
     const { rows } = await query(
@@ -236,7 +266,7 @@ router.get('/', async (req, res, next) => {
             const owner = profileId ? profileOwners.get(String(profileId)) : null;
             const ownerName =
               owner?.username || owner?.display_name || owner?.email || null;
-            const canReport =
+            const canReport = allowAll ||
               owner?.user_id === req.currentUser.id ||
               owner?.assigned_bidder_user_id === req.currentUser.id;
             return {
@@ -292,13 +322,14 @@ router.get('/', async (req, res, next) => {
 });
 
 router.get('/:applicationId/open', async (req, res, next) => {
+  const { allowAll } = getScopeContext(req);
   try {
     const { rows } = await query(
       `SELECT url
        FROM applications
-       WHERE id = $1 AND user_id = $2
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}
        LIMIT 1`,
-      [req.params.applicationId, req.currentUser.id]
+      allowAll ? [req.params.applicationId] : [req.params.applicationId, req.currentUser.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
     res.json({ url: rows[0].url });
@@ -308,11 +339,12 @@ router.get('/:applicationId/open', async (req, res, next) => {
 });
 
 router.delete('/:applicationId', async (req, res, next) => {
+  const { allowAll } = getScopeContext(req);
   try {
     const { rowCount } = await query(
       `DELETE FROM applications
-       WHERE id = $1 AND user_id = $2`,
-      [req.params.applicationId, req.currentUser.id]
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
+      allowAll ? [req.params.applicationId] : [req.params.applicationId, req.currentUser.id]
     );
     if (rowCount === 0) return res.status(404).json({ error: 'not_found' });
     res.status(204).send();

@@ -1,11 +1,36 @@
 import express from 'express';
 import { config } from '../config.js';
-import { query } from '../db.js';
+import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
-const isAdminOrManager = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+type RouteScope = 'user' | 'manager' | 'admin';
+
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
+
+const getRouteScope = (baseUrl: string | undefined): RouteScope => {
+  if (!baseUrl) return 'user';
+  if (baseUrl.startsWith('/admin/')) return 'admin';
+  if (baseUrl.startsWith('/manager/')) return 'manager';
+  return 'user';
+};
+
+const getScopeContext = (req: express.Request) => {
+  const scope = getRouteScope(req.baseUrl);
+  return { scope, allowAll: scope !== 'user' };
+};
+
+const requireScopeAccess: express.RequestHandler = (req, res, next) => {
+  const scope = getRouteScope(req.baseUrl);
+  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+    return res.status(403).json({ error: 'admin_required' });
+  }
+  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+    return res.status(403).json({ error: 'manager_required' });
+  }
+  return next();
+};
 let calendarSchemaPromise: Promise<void> | null = null;
 
 const ensureCalendarSchema = async () => {
@@ -131,9 +156,9 @@ router.use(async (_req, _res, next) => {
   }
 });
 
-router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.get('/accounts', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   try {
-    const allowAll = isAdminOrManager(req.currentUser?.roles);
+    const { allowAll } = getScopeContext(req);
     const filters = allowAll ? ['p.deleted_at IS NULL'] : ['(p.user_id = $1 OR p.assigned_bidder_user_id = $1)', 'p.deleted_at IS NULL'];
     const params: Array<string> = allowAll ? [] : [req.currentUser.id];
     const { rows } = await query(
@@ -161,7 +186,7 @@ router.get('/accounts', authRequired, fetchCurrentUser, async (req, res, next) =
   }
 });
 
-router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.get('/events', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const accountId = typeof req.query?.account_id === 'string' ? req.query.account_id : null;
   if (!accountId) {
     return res.status(400).json({ error: 'missing_account_id' });
@@ -170,7 +195,7 @@ router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => 
   const start = parseDate(req.query?.start);
   const end = parseDate(req.query?.end);
 
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
+  const { allowAll } = getScopeContext(req);
   const filters = allowAll
     ? ['p.deleted_at IS NULL', 'ce.email_account_id = $1']
     : ['(p.user_id = $1 OR ce.assigned_user_id = $1)', 'p.deleted_at IS NULL', 'ce.email_account_id = $2'];
@@ -209,17 +234,21 @@ router.get('/events', authRequired, fetchCurrentUser, async (req, res, next) => 
   }
 });
 
-router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, async (req, res, next) => {
-  if (!isAdminOrManager(req.currentUser?.roles)) {
+router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
+  const { allowAll } = getScopeContext(req);
+  if (!allowAll) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const eventId = req.params.eventId;
   const assigneeRaw = req.body?.assignee_user_id;
   const assigneeId = assigneeRaw ? String(assigneeRaw) : null;
 
+  const client = await getClient();
   try {
+    await client.query('BEGIN');
+
     if (assigneeId) {
-      const { rows } = await query(
+      const { rows } = await client.query(
         `SELECT 1
          FROM talents t
          WHERE COALESCE(t.user_id, t.id) = $1
@@ -228,25 +257,88 @@ router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, async (re
         [assigneeId]
       );
       if (!rows.length) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'assignee_not_caller' });
       }
     }
 
-    const { rows } = await query(
+    const { rows: eventRows } = await client.query(
+      `SELECT ce.start_at,
+              ce.end_at,
+              ce.profile_id,
+              p.user_id AS owner_id
+       FROM calendar_events ce
+       LEFT JOIN profiles p ON p.id = ce.profile_id
+       WHERE ce.id = $1
+       LIMIT 1`,
+      [eventId]
+    );
+    if (!eventRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const event = eventRows[0];
+    if (assigneeId) {
+      if (!event.profile_id || !event.owner_id) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'missing_profile_owner' });
+      }
+      const startAt = event.start_at ? new Date(event.start_at) : null;
+      const endAt = event.end_at ? new Date(event.end_at) : null;
+      if (!startAt || !endAt || Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime())) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'invalid_event_duration' });
+      }
+      const durationMinutes = Math.max(0, (endAt.getTime() - startAt.getTime()) / 60000);
+      const cost = Math.round(durationMinutes * 100) / 100;
+      if (cost > 0) {
+        const { rows: chargeRows } = await client.query(
+          `UPDATE users
+           SET balance = balance - $1
+           WHERE id = $2 AND balance >= $1
+           RETURNING balance`,
+          [cost, event.owner_id]
+        );
+        if (!chargeRows.length) {
+          await client.query('ROLLBACK');
+          const { rows: balanceRows } = await query(
+            `SELECT balance FROM users WHERE id = $1`,
+            [event.owner_id]
+          );
+          const balance = balanceRows[0]?.balance ?? 0;
+          return res.status(402).json({
+            error: 'insufficient_balance',
+            message: 'Insufficient balance to assign caller.',
+            balance,
+            required: cost
+          });
+        }
+      }
+    }
+
+    const { rows } = await client.query(
       `UPDATE calendar_events
        SET assigned_user_id = $2
        WHERE id = $1
        RETURNING id, email_account_id, title, start_at, end_at, assigned_user_id`,
       [eventId, assigneeId]
     );
-    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+    await client.query('COMMIT');
     return res.json(rows[0]);
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore rollback errors
+    }
     next(err);
+  } finally {
+    client.release();
   }
 });
 
-router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
+router.post('/sync', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
   const accountId =
     typeof req.body?.account_id === 'string'
       ? req.body.account_id
@@ -259,7 +351,7 @@ router.post('/sync', authRequired, fetchCurrentUser, async (req, res, next) => {
   const limit = parseLimit(req.body?.limit ?? req.query?.limit);
   const start = parseDate(req.body?.start ?? req.query?.start) ?? new Date(Date.now() - 7 * 864e5);
   const end = parseDate(req.body?.end ?? req.query?.end) ?? new Date(Date.now() + 60 * 864e5);
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
+  const { allowAll } = getScopeContext(req);
 
   try {
     const { rows } = await query(

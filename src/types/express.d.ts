@@ -16,6 +16,7 @@ declare global {
         bio: string | null;
         photo_link: string | null;
         plan: string;
+        balance: number;
         verified: boolean;
         last_login_at: string | Date | null;
         last_login_place: string | null;

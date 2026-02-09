@@ -34,6 +34,10 @@ The server listens on `http://localhost:4000` by default.
 - `POST /auth/logout` — stateless; returns `{ success: true }` (client should discard its token)
 
 ## Profiles API (auth required)
+- Route scopes:
+- `/profiles` for standard access (self + assigned visibility).
+- `/manager/profiles` for manager-only access (full visibility).
+- `/admin/profiles` for admin-only access (full visibility).
 - `GET /profiles` — query: `q?`, `limit?` (default 20, max 100), `cursor?`, `include_deleted?`. Returns `{ items: Profile[], next_cursor }`. Filters to the current user's profiles, defaulting to non-deleted, ordered newest-first with keyset pagination.
 - `POST /profiles` — body: `{ name (required), description?, base_info?, base_resume?, resume_template_id (required) }` → returns created `Profile`. Name is unique per user ignoring soft-deleted rows.
 - `GET /profiles/{profile_id}` — respects `?include_deleted=true`; 404 if not found or soft-deleted when not included.
@@ -62,3 +66,4 @@ The server listens on `http://localhost:4000` by default.
 ## Roles & user_roles tables
 - `roles`: master list seeded with keys `client, admin, manager, bidder, caller`; fields include `key` (unique, check-constrained), `name`, timestamps.
 - `user_roles`: assigns multiple roles to a user; fields `user_id`, `role_id`, `created_at`; unique on `(user_id, role_id)` with FK to users/roles.
+
