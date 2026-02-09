@@ -1,6 +1,11 @@
 import dotenv from 'dotenv';
 
-dotenv.config();
+const nodeEnv = (process.env.NODE_ENV || 'development').trim();
+const envFilePath = `.env.${nodeEnv}`;
+const envLoadResult = dotenv.config({ path: envFilePath });
+if (envLoadResult.error) {
+  dotenv.config();
+}
 
 const defaultScopes = [
   'offline_access',
@@ -28,13 +33,17 @@ const devOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000'
 ];
+const includeDevOrigins =
+  process.env.CORS_INCLUDE_DEV_ORIGINS === 'true' || nodeEnv !== 'production';
 
 const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-const corsOrigins = Array.from(new Set([defaultOrigin, ...devOrigins, ...extraCorsOrigins]));
+const corsOrigins = Array.from(
+  new Set([defaultOrigin, ...(includeDevOrigins ? devOrigins : []), ...extraCorsOrigins])
+);
 
 export type Config = {
   port: number;
@@ -66,6 +75,11 @@ export type Config = {
     apiKey: string;
     model: string;
     baseUrl: string;
+  };
+  supabase: {
+    url: string;
+    serviceRoleKey: string;
+    avatarBucket: string;
   };
 };
 
@@ -99,5 +113,10 @@ export const config: Config = {
     apiKey: process.env.OPENAI_API_KEY || '',
     model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
     baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+  },
+  supabase: {
+    url: (process.env.SUPABASE_URL || '').trim(),
+    serviceRoleKey: (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim(),
+    avatarBucket: (process.env.SUPABASE_AVATAR_BUCKET || 'avatars').trim()
   }
 };

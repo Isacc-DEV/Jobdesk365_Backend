@@ -1,9 +1,9 @@
 import express from 'express';
-import fs from 'fs';
-import path from 'path';
 import multer from 'multer';
 import jwt from 'jsonwebtoken';
 import type { SignOptions } from 'jsonwebtoken';
+import { randomUUID } from 'crypto';
+import { createClient } from '@supabase/supabase-js';
 import { config } from '../config.js';
 import { query } from '../db.js';
 import { hashPassword, comparePassword } from '../utils/password.js';
@@ -12,22 +12,22 @@ import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 const router = express.Router();
 const USERNAME_RE = /^[a-z0-9]+$/;
 const PLAN_VALUES = new Set(['free', 'plus', 'pro', 'pro_plus']);
-const AVATAR_DIR = path.resolve(process.cwd(), 'uploads', 'avatars');
 
-fs.mkdirSync(AVATAR_DIR, { recursive: true });
+const hasSupabaseAvatarConfig =
+  Boolean(config.supabase.url) &&
+  Boolean(config.supabase.serviceRoleKey) &&
+  Boolean(config.supabase.avatarBucket);
 
-const avatarStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, AVATAR_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || '').slice(0, 10);
-    const safeExt = ext.replace(/[^a-zA-Z0-9.]/g, '') || '';
-    const base = `${req.user?.id ?? 'user'}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    cb(null, `${base}${safeExt}`);
-  }
-});
+const supabase = hasSupabaseAvatarConfig
+  ? createClient(config.supabase.url, config.supabase.serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    })
+  : null;
+let avatarBucketEnsured = false;
+let avatarBucketEnsurePromise: Promise<void> | null = null;
 
 const avatarUpload = multer({
-  storage: avatarStorage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype && file.mimetype.startsWith('image/')) {
@@ -58,6 +58,53 @@ type UserRow = UserTokenData & {
   password_hash?: string;
   deleted_at?: string | Date | null;
 };
+
+function getAvatarExtension(file: Express.Multer.File) {
+  const originalExt = (file.originalname?.match(/\.[^.]+$/)?.[0] || '').toLowerCase();
+  const safeOriginalExt = originalExt.replace(/[^a-z0-9.]/g, '').slice(0, 10);
+  if (safeOriginalExt) {
+    return safeOriginalExt;
+  }
+  const mime = (file.mimetype || '').toLowerCase();
+  if (mime === 'image/jpeg') return '.jpg';
+  if (mime === 'image/png') return '.png';
+  if (mime === 'image/gif') return '.gif';
+  if (mime === 'image/webp') return '.webp';
+  return '.png';
+}
+
+async function ensureAvatarBucket() {
+  if (!supabase || avatarBucketEnsured) {
+    return;
+  }
+  if (avatarBucketEnsurePromise) {
+    return avatarBucketEnsurePromise;
+  }
+  avatarBucketEnsurePromise = (async () => {
+    const { data: existing, error: getError } = await supabase.storage.getBucket(config.supabase.avatarBucket);
+    if (!getError && existing?.name) {
+      avatarBucketEnsured = true;
+      return;
+    }
+
+    const { error: createError } = await supabase.storage.createBucket(config.supabase.avatarBucket, {
+      public: true,
+      fileSizeLimit: 5 * 1024 * 1024,
+      allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+    });
+
+    if (createError && !/already exists/i.test(createError.message || '')) {
+      throw new Error(createError.message || 'Unable to initialize avatar bucket.');
+    }
+    avatarBucketEnsured = true;
+  })();
+
+  try {
+    await avatarBucketEnsurePromise;
+  } finally {
+    avatarBucketEnsurePromise = null;
+  }
+}
 
 function signUser(user: UserTokenData) {
   return jwt.sign({ id: user.id, email: user.email, plan: user.plan }, config.jwt.secret, {
@@ -146,17 +193,57 @@ router.get('/me', authRequired, fetchCurrentUser, (req, res) => {
 });
 
 router.post('/me/avatar', authRequired, (req, res, next) => {
-  avatarUpload(req, res, (err) => {
+  avatarUpload(req, res, async (err) => {
     if (err) {
       return res.status(400).json({ error: 'upload_failed', message: err.message });
     }
     if (!req.file) {
       return res.status(400).json({ error: 'missing_file' });
     }
-    const host = req.get('host');
-    const protocol = req.protocol;
-    const photoLink = `${protocol}://${host}/uploads/avatars/${req.file.filename}`;
-    return res.json({ photo_link: photoLink });
+    if (!supabase) {
+      return res.status(500).json({
+        error: 'supabase_not_configured',
+        message: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured.'
+      });
+    }
+    try {
+      await ensureAvatarBucket();
+
+      const ext = getAvatarExtension(req.file);
+      const objectPath = `users/${req.user?.id || 'user'}/${Date.now()}-${randomUUID()}${ext}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(config.supabase.avatarBucket)
+        .upload(objectPath, req.file.buffer, {
+          cacheControl: '31536000',
+          contentType: req.file.mimetype || 'application/octet-stream',
+          upsert: true
+        });
+
+      if (uploadError) {
+        return res.status(500).json({ error: 'upload_failed', message: uploadError.message });
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(config.supabase.avatarBucket)
+        .getPublicUrl(objectPath);
+
+      const photoLink = publicUrlData?.publicUrl || '';
+      if (!photoLink) {
+        return res.status(500).json({ error: 'upload_failed', message: 'Unable to resolve avatar URL.' });
+      }
+
+      await query(
+        `UPDATE users
+         SET photo_link = $1
+         WHERE id = $2`,
+        [photoLink, req.user?.id]
+      );
+
+      return res.json({ photo_link: photoLink });
+    } catch (uploadErr) {
+      return next(uploadErr);
+    }
   });
 });
 
