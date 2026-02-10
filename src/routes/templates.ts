@@ -1,6 +1,7 @@
 import express from 'express';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { notifyResumeTemplateAdded } from '../services/notifications.js';
 
 const router = express.Router();
 
@@ -50,6 +51,11 @@ router.post('/', async (req, res, next) => {
        RETURNING id, title, description, code, created_by, created_at, updated_at`,
       [finalTitle, description ?? null, finalCode, req.currentUser.id]
     );
+    try {
+      await notifyResumeTemplateAdded(rows[0].title);
+    } catch (notifyErr) {
+      console.error('[notifications] resume template event failed', notifyErr);
+    }
     return res.status(201).json(rows[0]);
   } catch (err) {
     next(err);

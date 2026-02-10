@@ -15,7 +15,10 @@ import applicationRoutes from './routes/applications.js';
 import hireRoutes from './routes/hire.js';
 import adminRoutes from './routes/admin.js';
 import chatRoutes from './routes/chat.js';
+import billingRoutes from './routes/billing.js';
+import notificationsRoutes from './routes/notifications.js';
 import { initChatRealtime } from './realtime/chatRealtime.js';
+import { startNotificationScheduler } from './services/notificationScheduler.js';
 
 const app = express();
 
@@ -48,6 +51,10 @@ app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
+app.use('/billing', billingRoutes);
+app.use('/payments', billingRoutes);
+app.use('/payment', billingRoutes);
+
 app.use('/auth', authRoutes);
 app.use('/profiles', profileRoutes);
 app.use('/manager/profiles', createProfilesRouter('manager'));
@@ -69,6 +76,7 @@ app.use('/manager/hire', hireRoutes);
 app.use('/admin/hire', hireRoutes);
 app.use('/admin', adminRoutes);
 app.use('/chat', chatRoutes);
+app.use('/notifications', notificationsRoutes);
 
 // Error handler
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
@@ -78,6 +86,7 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 const server = http.createServer(app);
 initChatRealtime(server);
+startNotificationScheduler();
 
 server.listen(config.port, () => {
   console.log(`API listening on http://localhost:${config.port}`);

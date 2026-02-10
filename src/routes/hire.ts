@@ -1,6 +1,14 @@
 import express from 'express';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import {
+  notifyAssignBidderRequest,
+  notifyAssignCallerRequest,
+  notifyCallerRequestDecision,
+  notifyReassignBidderRequest,
+  notifyTalentAdded,
+  notifyUnassignBidderRequest
+} from '../services/notifications.js';
 
 const router = express.Router();
 type RouteScope = 'user' | 'manager' | 'admin';
@@ -387,6 +395,14 @@ const normalizeCallerDetail = (value: unknown) => {
   };
 };
 
+const runNotificationTask = async (label: string, task: () => Promise<void>) => {
+  try {
+    await task();
+  } catch (err) {
+    console.error(`[notifications] ${label} failed`, err);
+  }
+};
+
 const listTalents = async (req, res, next) => {
   const role = formatRole(String(req.query?.role || ''));
   if (!role) {
@@ -552,6 +568,9 @@ router.post('/talents', async (req, res, next) => {
       ]
     );
 
+    await runNotificationTask('talent added event', () =>
+      notifyTalentAdded({ talentUserId: userId, talentRole: role })
+    );
     return res.status(201).json(rows[0]);
   } catch (err) {
     next(err);
@@ -645,7 +664,22 @@ router.post('/requests', async (req, res, next) => {
        RETURNING *`,
       [req.currentUser.id, role, detail, assigneeId, hourlyRate, whenAt, status]
     );
-    res.status(201).json(rows[0]);
+    const createdRequest = rows[0];
+    if (role === 'bidder' && assigneeId) {
+      await runNotificationTask('assign bidder request event', () =>
+        notifyAssignBidderRequest({ requestId: createdRequest.id })
+      );
+    }
+    if (role === 'caller' && assigneeId) {
+      await runNotificationTask('assign caller request event', () =>
+        notifyAssignCallerRequest({
+          requestId: createdRequest.id,
+          profileOwnerUserId: createdRequest.user_id,
+          assignedCallerUserId: assigneeId
+        })
+      );
+    }
+    res.status(201).json(createdRequest);
   } catch (err) {
     next(err);
   }
@@ -655,90 +689,87 @@ router.patch('/requests/:requestId', async (req, res, next) => {
   const payload = req.body || {};
   const updates: string[] = [];
   const { allowAll } = getScopeContext(req);
-  const params: Array<unknown> = allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id];
+  const baseParams = allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id];
+  const params: Array<unknown> = [...baseParams];
   let idx = params.length;
 
-  const addField = (column: string, value: unknown) => {
-    if (value === undefined) return;
-    idx += 1;
-    updates.push(`${column} = $${idx}`);
-    params.push(value);
-  };
-
-  if (payload.role !== undefined) {
-    const role = formatRole(payload.role);
-    if (!role) return res.status(400).json({ error: 'invalid_role' });
-    addField('role', role);
-  }
-
-  if (payload.status !== undefined) {
-    const status = formatStatus(payload.status);
-    if (!status) return res.status(400).json({ error: 'invalid_status' });
-    addField('status', status);
-    addField('archived', status !== 'pending');
-  }
-
-  if (payload.assignee_user_id !== undefined) {
-    const nextAssigneeId = payload.assignee_user_id ? String(payload.assignee_user_id) : null;
-    let effectiveRole = payload.role ? formatRole(payload.role) : null;
-
-    if (!effectiveRole && nextAssigneeId) {
-      const roleResult = await query(
-        `SELECT role FROM requests WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
-        allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
-      );
-      if (!roleResult.rows.length) return res.status(404).json({ error: 'not_found' });
-      effectiveRole = roleResult.rows[0].role;
-    }
-
-    let rateValue: number | null = null;
-    if (nextAssigneeId) {
-      const rateResult = await query(
-        `SELECT t.rate
-         FROM talents t
-         WHERE COALESCE(t.user_id, t.id) = $1 AND t.talent_role = $2`,
-        [nextAssigneeId, effectiveRole]
-      );
-      if (!rateResult.rows.length) {
-        return res.status(400).json({ error: 'assignee_not_found' });
-      }
-      const rawRate = rateResult.rows[0].rate;
-      rateValue = rawRate === null || rawRate === undefined ? null : Number(rawRate);
-    }
-
-    addField('assignee_user_id', nextAssigneeId);
-    addField('hourly_rate', rateValue);
-  }
-
-  if (payload.when_at !== undefined) {
-    addField('when_at', payload.when_at ? new Date(payload.when_at).toISOString() : null);
-  }
-
-  if (payload.detail !== undefined) {
-    const normalized = normalizeDetail(payload.detail);
-    let effectiveRole = payload.role ? formatRole(payload.role) : null;
-    if (!effectiveRole) {
-      const roleResult = await query(
-        `SELECT role FROM requests WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}`,
-        allowAll ? [req.params.requestId] : [req.params.requestId, req.currentUser.id]
-      );
-      if (!roleResult.rows.length) return res.status(404).json({ error: 'not_found' });
-      effectiveRole = roleResult.rows[0].role;
-    }
-    if (effectiveRole === 'caller') {
-      const callerDetail = normalizeCallerDetail(normalized);
-      if (!callerDetail) return res.status(400).json({ error: 'caller_detail_required' });
-      addField('detail', callerDetail);
-    } else {
-      addField('detail', normalized);
-    }
-  }
-
-  if (updates.length === 0) {
-    return res.status(400).json({ error: 'no_fields_to_update' });
-  }
-
   try {
+    const { rows: existingRows } = await query<{
+      id: string;
+      user_id: string;
+      role: 'bidder' | 'caller';
+      status: 'pending' | 'working' | 'closed';
+      assignee_user_id: string | null;
+    }>(
+      `SELECT id, user_id, role, status, assignee_user_id
+       FROM requests
+       WHERE id = $1 ${allowAll ? '' : 'AND user_id = $2'}
+       LIMIT 1`,
+      baseParams
+    );
+    if (!existingRows.length) return res.status(404).json({ error: 'not_found' });
+    const existing = existingRows[0];
+    const nextRole = payload.role !== undefined ? formatRole(payload.role) : existing.role;
+    if (!nextRole) return res.status(400).json({ error: 'invalid_role' });
+
+    const addField = (column: string, value: unknown) => {
+      if (value === undefined) return;
+      idx += 1;
+      updates.push(`${column} = $${idx}`);
+      params.push(value);
+    };
+
+    if (payload.role !== undefined) {
+      addField('role', nextRole);
+    }
+
+    if (payload.status !== undefined) {
+      const status = formatStatus(payload.status);
+      if (!status) return res.status(400).json({ error: 'invalid_status' });
+      addField('status', status);
+      addField('archived', status !== 'pending');
+    }
+
+    if (payload.assignee_user_id !== undefined) {
+      const nextAssigneeId = payload.assignee_user_id ? String(payload.assignee_user_id) : null;
+      let rateValue: number | null = null;
+      if (nextAssigneeId) {
+        const rateResult = await query(
+          `SELECT t.rate
+           FROM talents t
+           WHERE COALESCE(t.user_id, t.id) = $1 AND t.talent_role = $2`,
+          [nextAssigneeId, nextRole]
+        );
+        if (!rateResult.rows.length) {
+          return res.status(400).json({ error: 'assignee_not_found' });
+        }
+        const rawRate = rateResult.rows[0].rate;
+        rateValue = rawRate === null || rawRate === undefined ? null : Number(rawRate);
+      }
+
+      addField('assignee_user_id', nextAssigneeId);
+      addField('hourly_rate', rateValue);
+    }
+
+    if (payload.when_at !== undefined) {
+      addField('when_at', payload.when_at ? new Date(payload.when_at).toISOString() : null);
+    }
+
+    if (payload.detail !== undefined) {
+      const normalized = normalizeDetail(payload.detail);
+      if (nextRole === 'caller') {
+        const callerDetail = normalizeCallerDetail(normalized);
+        if (!callerDetail) return res.status(400).json({ error: 'caller_detail_required' });
+        addField('detail', callerDetail);
+      } else {
+        addField('detail', normalized);
+      }
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'no_fields_to_update' });
+    }
+
     const { rows } = await query(
       `UPDATE requests
        SET ${updates.join(', ')}
@@ -746,8 +777,72 @@ router.patch('/requests/:requestId', async (req, res, next) => {
        RETURNING *`,
       params
     );
-    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
-    res.json(rows[0]);
+    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+
+    const updated = rows[0];
+    const previousAssignee = existing.assignee_user_id ? String(existing.assignee_user_id) : null;
+    const nextAssignee = updated.assignee_user_id ? String(updated.assignee_user_id) : null;
+    const assigneeChanged = previousAssignee !== nextAssignee;
+    const statusChanged = existing.status !== updated.status;
+    const roleAfterUpdate = updated.role as 'bidder' | 'caller';
+
+    if (payload.assignee_user_id !== undefined && assigneeChanged && roleAfterUpdate === 'bidder') {
+      if (!previousAssignee && nextAssignee) {
+        await runNotificationTask('assign bidder request event', () =>
+          notifyAssignBidderRequest({ requestId: updated.id })
+        );
+      } else if (previousAssignee && nextAssignee) {
+        await runNotificationTask('reassign bidder request event', () =>
+          notifyReassignBidderRequest({
+            requestId: updated.id,
+            requesterUserId: updated.user_id,
+            currentAssigneeUserId: nextAssignee
+          })
+        );
+      } else if (previousAssignee && !nextAssignee) {
+        await runNotificationTask('unassign bidder request event', () =>
+          notifyUnassignBidderRequest({
+            requestId: updated.id,
+            requesterUserId: updated.user_id,
+            previousAssigneeUserId: previousAssignee
+          })
+        );
+      }
+    }
+
+    if (payload.assignee_user_id !== undefined && assigneeChanged && nextAssignee && roleAfterUpdate === 'caller') {
+      await runNotificationTask('assign caller request event', () =>
+        notifyAssignCallerRequest({
+          requestId: updated.id,
+          profileOwnerUserId: updated.user_id,
+          assignedCallerUserId: nextAssignee
+        })
+      );
+    }
+
+    if (payload.status !== undefined && statusChanged && roleAfterUpdate === 'caller') {
+      if (updated.status === 'working') {
+        await runNotificationTask('caller request accepted event', () =>
+          notifyCallerRequestDecision({
+            requestId: updated.id,
+            profileOwnerUserId: updated.user_id,
+            assignedCallerUserId: nextAssignee,
+            accepted: true
+          })
+        );
+      } else if (updated.status === 'closed') {
+        await runNotificationTask('caller request rejected event', () =>
+          notifyCallerRequestDecision({
+            requestId: updated.id,
+            profileOwnerUserId: updated.user_id,
+            assignedCallerUserId: nextAssignee,
+            accepted: false
+          })
+        );
+      }
+    }
+
+    res.json(updated);
   } catch (err) {
     next(err);
   }

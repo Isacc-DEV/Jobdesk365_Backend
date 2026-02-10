@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import { query } from '../db.js';
 import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { notifyAssignBidderToProfile, notifyProfileCreated } from '../services/notifications.js';
 
 type ProfilesAccessMode = 'user' | 'manager' | 'admin';
 
@@ -149,6 +150,11 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
     );
     const createdId = rows[0]?.id;
     const created = await fetchProfileOr404(createdId, true, req.currentUser.id);
+    try {
+      await notifyProfileCreated(req.currentUser.id, created?.name || name);
+    } catch (notifyErr) {
+      console.error('[notifications] profile created event failed', notifyErr);
+    }
     return res.status(201).json(created);
   } catch (err) {
     if (err.code === '23505') {
@@ -348,6 +354,16 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
       bidder_user_id
     );
     if (!profile) return res.status(404).json({ error: 'not_found' });
+    try {
+      await notifyAssignBidderToProfile({
+        profileId: profile.id,
+        profileName: profile.name || 'Profile',
+        profileOwnerUserId: profile.user_id,
+        bidderUserId: bidder_user_id
+      });
+    } catch (notifyErr) {
+      console.error('[notifications] assign bidder event failed', notifyErr);
+    }
     return res.json(profile);
   } catch (err) {
     next(err);

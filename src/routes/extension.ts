@@ -1,6 +1,7 @@
 import express from 'express';
 import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { notifyProfileCreated } from '../services/notifications.js';
 
 const router = express.Router();
 const APPLICATION_COST = 0.08;
@@ -792,6 +793,11 @@ router.post('/profiles', async (req, res, next) => {
         templateId
       ]
     );
+    try {
+      await notifyProfileCreated(req.currentUser.id, profileName);
+    } catch (notifyErr) {
+      console.error('[notifications] profile created event failed', notifyErr);
+    }
     res.status(201).json(mapExtensionProfile(rows[0]));
   } catch (err) {
     const error = err as any;

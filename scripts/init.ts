@@ -191,6 +191,37 @@ async function applySchema() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type text NOT NULL,
+        title text NOT NULL,
+        message text NOT NULL,
+        redirect_url text NOT NULL,
+        is_read boolean NOT NULL DEFAULT false,
+        read_at timestamptz,
+        dedupe_key text,
+        metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_created_at
+      ON notifications (user_id, created_at DESC, id DESC)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_unread
+      ON notifications (user_id, is_read, created_at DESC)
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe_key
+      ON notifications (dedupe_key)
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS resume_templates (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         title text NOT NULL,
