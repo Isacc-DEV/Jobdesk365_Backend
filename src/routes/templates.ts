@@ -9,40 +9,23 @@ router.use(authRequired, fetchCurrentUser);
 const isAdminOrManager = (roles?: string[] | null) =>
   Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
 
-// List resume templates for the current user
+// List resume templates for all authenticated users
 router.get('/', async (req, res, next) => {
-  const scope = String(req.query?.scope || '').toLowerCase();
-  const allowAll = scope === 'all' && isAdminOrManager(req.currentUser?.roles);
   try {
     const { rows } = await query(
-      allowAll
-        ? `SELECT rt.id,
-                  rt.title,
-                  rt.description,
-                  rt.created_by,
-                  rt.created_at,
-                  rt.updated_at,
-                  COUNT(p.id) FILTER (WHERE p.deleted_at IS NULL) AS profile_count,
-                  COUNT(DISTINCT p.user_id) FILTER (WHERE p.deleted_at IS NULL) AS people_count
-           FROM resume_templates rt
-           LEFT JOIN profiles p ON p.resume_template_id = rt.id
-           WHERE rt.deleted_at IS NULL
-           GROUP BY rt.id
-           ORDER BY rt.created_at DESC`
-        : `SELECT rt.id,
-                  rt.title,
-                  rt.description,
-                  rt.created_by,
-                  rt.created_at,
-                  rt.updated_at,
-                  COUNT(p.id) FILTER (WHERE p.deleted_at IS NULL AND p.user_id = $1) AS profile_count,
-                  COUNT(DISTINCT p.user_id) FILTER (WHERE p.deleted_at IS NULL AND p.user_id = $1) AS people_count
-           FROM resume_templates rt
-           LEFT JOIN profiles p ON p.resume_template_id = rt.id
-           WHERE rt.deleted_at IS NULL AND rt.created_by = $1
-           GROUP BY rt.id
-           ORDER BY rt.created_at DESC`,
-      allowAll ? [] : [req.currentUser.id]
+      `SELECT rt.id,
+              rt.title,
+              rt.description,
+              rt.created_by,
+              rt.created_at,
+              rt.updated_at,
+              COUNT(p.id) FILTER (WHERE p.deleted_at IS NULL) AS profile_count,
+              COUNT(DISTINCT p.user_id) FILTER (WHERE p.deleted_at IS NULL) AS people_count
+       FROM resume_templates rt
+       LEFT JOIN profiles p ON p.resume_template_id = rt.id
+       WHERE rt.deleted_at IS NULL
+       GROUP BY rt.id
+       ORDER BY rt.created_at DESC`
     );
     return res.json({ items: rows });
   } catch (err) {
@@ -75,7 +58,6 @@ router.post('/', async (req, res, next) => {
 
 // Get a single template (including code)
 router.get('/:templateId', async (req, res, next) => {
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
   try {
     const { rows } = await query(
       `SELECT id,
@@ -86,9 +68,9 @@ router.get('/:templateId', async (req, res, next) => {
               created_at,
               updated_at
        FROM resume_templates
-       WHERE id = $1 ${allowAll ? '' : 'AND created_by = $2'} AND deleted_at IS NULL
+       WHERE id = $1 AND deleted_at IS NULL
        LIMIT 1`,
-      allowAll ? [req.params.templateId] : [req.params.templateId, req.currentUser.id]
+      [req.params.templateId]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
     return res.json(rows[0]);
