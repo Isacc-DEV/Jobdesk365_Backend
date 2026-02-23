@@ -1,5 +1,6 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'node:crypto';
 import { query } from '../db.js';
 import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
@@ -58,6 +59,10 @@ function toOrigin(value: unknown): string | null {
   } catch (err) {
     return null;
   }
+}
+
+function logOutlookAuthorize(event: string, payload: Record<string, unknown>): void {
+  console.info(`[outlook-connect][authorize][${event}] ${JSON.stringify(payload)}`);
 }
 
 const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
@@ -394,7 +399,18 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
 
   // 8) Start Outlook email connection
   router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
+  const connectTraceId = randomUUID();
+  const requestOrigin = toOrigin(req.get('origin'));
+  const routeScope = mode;
+
   if (!isOutlookConfigured()) {
+    logOutlookAuthorize('outlook_not_configured', {
+      trace_id: connectTraceId,
+      profile_id: req.params.profileId,
+      user_id: req.currentUser.id,
+      route_scope: routeScope,
+      origin: requestOrigin
+    });
     return res.status(503).json({ error: 'outlook_not_configured' });
   }
 
@@ -406,22 +422,48 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
        LIMIT 1`,
       [req.params.profileId, req.currentUser.id]
     );
-    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    if (rows.length === 0) {
+      logOutlookAuthorize('owner_scope_guard_not_found', {
+        trace_id: connectTraceId,
+        profile_id: req.params.profileId,
+        user_id: req.currentUser.id,
+        route_scope: routeScope,
+        origin: requestOrigin
+      });
+      return res.status(404).json({ error: 'not_found' });
+    }
 
     const state = jwt.sign(
       {
         purpose: 'outlook_connect',
         profile_id: req.params.profileId,
         user_id: req.currentUser.id,
-        frontend_origin: toOrigin(req.get('origin'))
+        frontend_origin: requestOrigin,
+        connect_trace_id: connectTraceId
       },
       config.jwt.secret,
       { expiresIn: '10m' }
     );
 
+    logOutlookAuthorize('authorize_ready', {
+      trace_id: connectTraceId,
+      profile_id: req.params.profileId,
+      user_id: req.currentUser.id,
+      route_scope: routeScope,
+      origin: requestOrigin
+    });
+
     const url = buildOutlookAuthorizeUrl(state);
     return res.json({ url });
   } catch (err) {
+    logOutlookAuthorize('authorize_failed', {
+      trace_id: connectTraceId,
+      profile_id: req.params.profileId,
+      user_id: req.currentUser.id,
+      route_scope: routeScope,
+      origin: requestOrigin,
+      error: err instanceof Error ? err.message : String(err)
+    });
     next(err);
   }
   });

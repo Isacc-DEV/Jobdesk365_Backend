@@ -58,6 +58,16 @@ The server listens on `http://localhost:4000` by default.
 - `DELETE /profiles/{profile_id}` â€” soft-deletes profile (sets `deleted_at`), clears bidder assignment; returns 204.
 - `POST /profiles/{profile_id}/assign-bidder` â€” body: `{ bidder_user_id }`; bidder must hold the `bidder` role in `user_roles`. Returns updated `Profile`.
 - `POST /profiles/{profile_id}/unassign-bidder` â€” clears `assigned_bidder_user_id/assigned_at`. Returns updated `Profile`.
+- `POST /profiles/{profile_id}/email/outlook/authorize` â€” returns Outlook OAuth URL and signed `state`; this step does not write `email_accounts`.
+- `POST /admin/profiles/{profile_id}/email/outlook/authorize` â€” same behavior as user route but still owner-scoped (admin/manager cannot connect another user's mailbox).
+
+## Outlook OAuth callback behavior
+- Token and profile writes happen only in `GET /email/outlook/callback`.
+- Successful callback updates:
+  - `email_accounts` (insert or update)
+  - `profiles.email_account_id` (when linking first time)
+- OAuth flow logs include `trace_id` and DB fingerprint (`database`, `server_address`, `server_port`) to verify which runtime DB is being written.
+- Production verification runbook: `Backend/docs/outlook-oauth-production-runbook.md`
 
 ## Users table
 - `id` uuid PK (default `gen_random_uuid()`)

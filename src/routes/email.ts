@@ -1,11 +1,24 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
 type RouteScope = 'user' | 'manager' | 'admin';
+type OutlookConnectState = {
+  purpose?: string;
+  profile_id?: string;
+  user_id?: string;
+  frontend_origin?: string | null;
+  connect_trace_id?: string;
+};
+type DbFingerprint = {
+  database: string;
+  serverAddress: string;
+  serverPort: string;
+};
 
 const hasRole = (roles: string[] | null | undefined, role: string) =>
   Array.isArray(roles) && roles.includes(role);
@@ -38,6 +51,75 @@ function parseLimit(value: unknown): number {
   if (!Number.isFinite(num) || num <= 0) return 50;
   return Math.min(Math.floor(num), 200);
 }
+
+const logOutlookCallback = (
+  event: string,
+  traceId: string,
+  payload: Record<string, unknown>
+): void => {
+  console.info(
+    `[outlook-connect][callback][${event}] ${JSON.stringify({
+      trace_id: traceId,
+      ...payload
+    })}`
+  );
+};
+
+let dbFingerprint: DbFingerprint | null = null;
+let dbFingerprintPromise: Promise<DbFingerprint | null> | null = null;
+let dbFingerprintLogged = false;
+
+const fetchDbFingerprint = async (): Promise<DbFingerprint | null> => {
+  if (dbFingerprint) return dbFingerprint;
+  if (dbFingerprintPromise) return dbFingerprintPromise;
+
+  dbFingerprintPromise = (async () => {
+    try {
+      const { rows } = await query<{
+        db_name: string | null;
+        server_addr: string | null;
+        server_port: number | null;
+      }>(
+        `SELECT current_database()::text AS db_name,
+                COALESCE(inet_server_addr()::text, 'local') AS server_addr,
+                inet_server_port() AS server_port`
+      );
+      const row = rows[0];
+      if (!row) return null;
+      dbFingerprint = {
+        database: row.db_name || 'unknown',
+        serverAddress: row.server_addr || 'unknown',
+        serverPort: row.server_port == null ? 'unknown' : String(row.server_port)
+      };
+      return dbFingerprint;
+    } catch (err) {
+      console.warn(
+        `[outlook-connect][callback][db_fingerprint_failed] ${JSON.stringify({
+          error: err instanceof Error ? err.message : String(err)
+        })}`
+      );
+      return null;
+    } finally {
+      dbFingerprintPromise = null;
+    }
+  })();
+
+  return dbFingerprintPromise;
+};
+
+const ensureDbFingerprintLogged = async (traceId: string): Promise<DbFingerprint | null> => {
+  const fingerprint = await fetchDbFingerprint();
+  if (!fingerprint) return null;
+  if (!dbFingerprintLogged) {
+    logOutlookCallback('db_fingerprint', traceId, {
+      database: fingerprint.database,
+      server_address: fingerprint.serverAddress,
+      server_port: fingerprint.serverPort
+    });
+    dbFingerprintLogged = true;
+  }
+  return fingerprint;
+};
 
 const getFrontendOrigin = (): string => {
   const origin = toOrigin(config.frontendUrl);
@@ -79,15 +161,26 @@ const escapeHtml = (value: string): string =>
 type CallbackPageInput = {
   status: 'success' | 'error';
   profileId?: string | null;
+  emailAccountId?: string | null;
+  traceId?: string | null;
   message?: string | null;
   frontendOrigin?: string | null;
 };
 
-const renderCallbackPage = ({ status, profileId, message, frontendOrigin }: CallbackPageInput): string => {
+const renderCallbackPage = ({
+  status,
+  profileId,
+  emailAccountId,
+  traceId,
+  message,
+  frontendOrigin
+}: CallbackPageInput): string => {
   const targetOrigin = resolveFrontendOrigin(frontendOrigin);
   const payload = {
     type: status === 'success' ? 'email_connected' : 'email_connect_error',
     profileId: profileId || null,
+    emailAccountId: emailAccountId || null,
+    traceId: traceId || null,
     message: message || null
   };
   const safePayload = JSON.stringify(payload);
@@ -714,43 +807,92 @@ router.get('/outlook/callback', async (req, res, next) => {
   const error = typeof req.query?.error === 'string' ? req.query.error : undefined;
   const errorDescription =
     typeof req.query?.error_description === 'string' ? req.query.error_description : undefined;
+  let traceId: string = randomUUID();
+  let callbackOrigin: string | null = null;
 
   if (error) {
     const message = errorDescription || error;
-    return res.status(400).send(renderCallbackPage({ status: 'error', message }));
+    logOutlookCallback('oauth_error', traceId, {
+      message,
+      has_code: Boolean(code),
+      has_state: Boolean(state)
+    });
+    return res.status(400).send(renderCallbackPage({ status: 'error', message, traceId }));
   }
 
   if (!code || !state) {
+    logOutlookCallback('missing_code_or_state', traceId, {
+      has_code: Boolean(code),
+      has_state: Boolean(state)
+    });
     return res
       .status(400)
-      .send(renderCallbackPage({ status: 'error', message: 'Missing code or state.' }));
+      .send(renderCallbackPage({ status: 'error', message: 'Missing code or state.', traceId }));
   }
 
   if (!config.outlook.clientId || !config.outlook.clientSecret || !config.outlook.redirectUri) {
+    logOutlookCallback('outlook_not_configured', traceId, {
+      has_client_id: Boolean(config.outlook.clientId),
+      has_client_secret: Boolean(config.outlook.clientSecret),
+      has_redirect_uri: Boolean(config.outlook.redirectUri)
+    });
     return res
       .status(500)
-      .send(renderCallbackPage({ status: 'error', message: 'Outlook integration not configured.' }));
+      .send(
+        renderCallbackPage({
+          status: 'error',
+          message: 'Outlook integration not configured.',
+          traceId
+        })
+      );
   }
 
-  let payload: any;
+  let payload: OutlookConnectState;
   try {
-    payload = jwt.verify(state, config.jwt.secret);
+    payload = jwt.verify(state, config.jwt.secret) as OutlookConnectState;
   } catch (err) {
+    logOutlookCallback('invalid_state_token', traceId, {
+      error: err instanceof Error ? err.message : String(err)
+    });
     return res
       .status(400)
-      .send(renderCallbackPage({ status: 'error', message: 'Invalid state token.' }));
+      .send(renderCallbackPage({ status: 'error', message: 'Invalid state token.', traceId }));
   }
 
-  const callbackOrigin = resolveFrontendOrigin(payload?.frontend_origin);
+  if (typeof payload?.connect_trace_id === 'string' && payload.connect_trace_id.trim()) {
+    traceId = payload.connect_trace_id;
+  }
+  callbackOrigin = resolveFrontendOrigin(payload?.frontend_origin);
+  const dbTarget = await ensureDbFingerprintLogged(traceId);
+
+  logOutlookCallback('callback_start', traceId, {
+    profile_id: payload?.profile_id || null,
+    user_id: payload?.user_id || null,
+    has_code: Boolean(code),
+    origin: callbackOrigin,
+    db_fingerprint: dbTarget
+      ? {
+          database: dbTarget.database,
+          server_address: dbTarget.serverAddress,
+          server_port: dbTarget.serverPort
+        }
+      : null
+  });
 
   if (payload?.purpose !== 'outlook_connect' || !payload?.profile_id || !payload?.user_id) {
+    logOutlookCallback('invalid_state_payload', traceId, {
+      purpose: payload?.purpose || null,
+      profile_id: payload?.profile_id || null,
+      user_id: payload?.user_id || null
+    });
     return res
       .status(400)
       .send(
         renderCallbackPage({
           status: 'error',
           message: 'Invalid state payload.',
-          frontendOrigin: callbackOrigin
+          frontendOrigin: callbackOrigin,
+          traceId
         })
       );
   }
@@ -770,9 +912,23 @@ router.get('/outlook/callback', async (req, res, next) => {
     const tokenData = await fetchJson(tokenResponse);
     if (!tokenResponse.ok) {
       const message = tokenData.error_description || tokenData.error || 'Token exchange failed.';
+      logOutlookCallback('token_exchange_failed', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id,
+        status: tokenResponse.status,
+        oauth_error: tokenData.error || null,
+        oauth_error_description: tokenData.error_description || null
+      });
       return res
         .status(400)
-        .send(renderCallbackPage({ status: 'error', message, frontendOrigin: callbackOrigin }));
+        .send(
+          renderCallbackPage({
+            status: 'error',
+            message,
+            frontendOrigin: callbackOrigin,
+            traceId
+          })
+        );
     }
 
     const accessToken = tokenData.access_token;
@@ -783,14 +939,27 @@ router.get('/outlook/callback', async (req, res, next) => {
       ? new Date(Date.now() + expiresIn * 1000)
       : null;
 
+    logOutlookCallback('token_exchange_succeeded', traceId, {
+      profile_id: payload.profile_id,
+      user_id: payload.user_id,
+      status: tokenResponse.status,
+      has_access_token: Boolean(accessToken),
+      has_refresh_token: Boolean(refreshToken)
+    });
+
     if (!accessToken) {
+      logOutlookCallback('token_missing_access_token', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id
+      });
       return res
         .status(400)
         .send(
           renderCallbackPage({
             status: 'error',
             message: 'Missing access token.',
-            frontendOrigin: callbackOrigin
+            frontendOrigin: callbackOrigin,
+            traceId
           })
         );
     }
@@ -803,12 +972,31 @@ router.get('/outlook/callback', async (req, res, next) => {
     const meData = await fetchJson(meResponse);
     if (!meResponse.ok) {
       const message = meData.error?.message || 'Unable to fetch Outlook profile.';
+      logOutlookCallback('graph_me_failed', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id,
+        status: meResponse.status,
+        graph_error: meData.error?.message || null
+      });
       return res
         .status(400)
-        .send(renderCallbackPage({ status: 'error', message, frontendOrigin: callbackOrigin }));
+        .send(
+          renderCallbackPage({
+            status: 'error',
+            message,
+            frontendOrigin: callbackOrigin,
+            traceId
+          })
+        );
     }
 
     const emailAddress = meData.mail || meData.userPrincipalName || '';
+    logOutlookCallback('graph_me_succeeded', traceId, {
+      profile_id: payload.profile_id,
+      user_id: payload.user_id,
+      status: meResponse.status,
+      has_email_address: Boolean(emailAddress)
+    });
 
     const client = await getClient();
     try {
@@ -823,21 +1011,31 @@ router.get('/outlook/callback', async (req, res, next) => {
 
       if (rows.length === 0) {
         await client.query('ROLLBACK');
+        logOutlookCallback('owner_scope_guard_profile_not_found', traceId, {
+          profile_id: payload.profile_id,
+          user_id: payload.user_id
+        });
         return res
           .status(404)
           .send(
             renderCallbackPage({
               status: 'error',
               message: 'Profile not found.',
-              frontendOrigin: callbackOrigin
+              frontendOrigin: callbackOrigin,
+              traceId
             })
           );
       }
 
       let emailAccountId = rows[0].email_account_id;
+      logOutlookCallback('db_profile_lookup', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id,
+        existing_email_account_id: emailAccountId || null
+      });
 
       if (emailAccountId) {
-        await client.query(
+        const updateResult = await client.query(
           `UPDATE email_accounts
            SET provider = 'outlook',
                email_address = $1,
@@ -849,6 +1047,11 @@ router.get('/outlook/callback', async (req, res, next) => {
            WHERE id = $6`,
           [emailAddress, accessToken, refreshToken, tokenExpiresAt, scope, emailAccountId]
         );
+        logOutlookCallback('db_email_account_updated', traceId, {
+          profile_id: payload.profile_id,
+          email_account_id: emailAccountId,
+          row_count: updateResult.rowCount
+        });
       } else {
         const insertResult = await client.query(
           `INSERT INTO email_accounts
@@ -858,32 +1061,66 @@ router.get('/outlook/callback', async (req, res, next) => {
           [emailAddress, accessToken, refreshToken, tokenExpiresAt, scope]
         );
         emailAccountId = insertResult.rows[0]?.id;
+        logOutlookCallback('db_email_account_inserted', traceId, {
+          profile_id: payload.profile_id,
+          email_account_id: emailAccountId || null,
+          row_count: insertResult.rowCount
+        });
         if (emailAccountId) {
-          await client.query(
+          const linkResult = await client.query(
             `UPDATE profiles
              SET email_account_id = $1
              WHERE id = $2`,
             [emailAccountId, payload.profile_id]
           );
+          logOutlookCallback('db_profile_link_updated', traceId, {
+            profile_id: payload.profile_id,
+            email_account_id: emailAccountId,
+            row_count: linkResult.rowCount
+          });
         }
       }
 
       await client.query('COMMIT');
+      logOutlookCallback('callback_commit_succeeded', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id,
+        email_account_id: emailAccountId || null,
+        db_fingerprint: dbTarget
+          ? {
+              database: dbTarget.database,
+              server_address: dbTarget.serverAddress,
+              server_port: dbTarget.serverPort
+            }
+          : null
+      });
+
+      return res.send(
+        renderCallbackPage({
+          status: 'success',
+          profileId: payload.profile_id,
+          emailAccountId: emailAccountId || null,
+          frontendOrigin: callbackOrigin,
+          traceId
+        })
+      );
     } catch (err) {
       await client.query('ROLLBACK');
+      logOutlookCallback('db_transaction_failed', traceId, {
+        profile_id: payload.profile_id,
+        user_id: payload.user_id,
+        error: err instanceof Error ? err.message : String(err)
+      });
       throw err;
     } finally {
       client.release();
     }
-
-    return res.send(
-      renderCallbackPage({
-        status: 'success',
-        profileId: payload.profile_id,
-        frontendOrigin: callbackOrigin
-      })
-    );
   } catch (err) {
+    logOutlookCallback('callback_failed', traceId, {
+      profile_id: payload?.profile_id || null,
+      user_id: payload?.user_id || null,
+      error: err instanceof Error ? err.message : String(err)
+    });
     next(err);
   }
 });
