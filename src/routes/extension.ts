@@ -246,12 +246,29 @@ const ensureExtensionSchema = async () => {
         url text NOT NULL,
         url_normalized text NOT NULL,
         title text,
+        notes text,
+        job_description text,
         open_count integer NOT NULL DEFAULT 0,
         last_opened_at timestamptz DEFAULT NULL,
         created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now(),
         CONSTRAINT job_links_user_url_unique UNIQUE (user_id, url_normalized)
       )
+    `);
+
+    // Add notes and job_description columns if they don't exist
+    await query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'job_links' AND column_name = 'notes') THEN
+          ALTER TABLE job_links ADD COLUMN notes text;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name = 'job_links' AND column_name = 'job_description') THEN
+          ALTER TABLE job_links ADD COLUMN job_description text;
+        END IF;
+      END $$;
     `);
 
     await query(`
@@ -721,12 +738,33 @@ const mergeExtensionProfile = (baseInfo: any, payload: any) => {
 // Extension profiles
 router.get('/profiles', async (req, res, next) => {
   try {
+    const userRoles = req.currentUser?.roles || [];
+    const isAdmin = userRoles.includes('admin');
+    const isManager = userRoles.includes('manager');
+    const isBidder = userRoles.includes('bidder');
+    
+    let whereClause = 'p.deleted_at IS NULL';
+    let params: any[] = [];
+    
+    if (isAdmin || isManager) {
+      // Return all profiles
+      whereClause = 'p.deleted_at IS NULL';
+    } else if (isBidder) {
+      // Return assigned profiles
+      whereClause = 'p.assigned_bidder_user_id = $1 AND p.deleted_at IS NULL';
+      params = [req.currentUser.id];
+    } else {
+      // Return owned profiles
+      whereClause = 'p.user_id = $1 AND p.deleted_at IS NULL';
+      params = [req.currentUser.id];
+    }
+    
     const { rows } = await query(
       `SELECT *
-       FROM profiles
-       WHERE user_id = $1 AND deleted_at IS NULL
-       ORDER BY created_at ASC`,
-      [req.currentUser.id]
+       FROM profiles p
+       WHERE ${whereClause}
+       ORDER BY p.created_at ASC`,
+      params
     );
     res.json(rows.map(mapExtensionProfile));
   } catch (err) {
@@ -1286,17 +1324,21 @@ router.post('/job-links', async (req, res, next) => {
       const normalized = link.url_normalized ? String(link.url_normalized) : normalizeJobUrl(urlValue);
       if (!normalized) continue;
       const title = link.title ? String(link.title).trim() : null;
+      const notes = link.notes ? String(link.notes).trim() : null;
+      const jobDescription = link.job_description ? String(link.job_description).trim() : null;
 
       const { rows } = await query(
-        `INSERT INTO job_links (user_id, url, url_normalized, title)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO job_links (user_id, url, url_normalized, title, notes, job_description)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (user_id, url_normalized)
          DO UPDATE SET
            url = EXCLUDED.url,
            title = COALESCE(EXCLUDED.title, job_links.title),
+           notes = COALESCE(EXCLUDED.notes, job_links.notes),
+           job_description = COALESCE(EXCLUDED.job_description, job_links.job_description),
            updated_at = now()
          RETURNING *`,
-        [req.currentUser.id, ensureUrlProtocol(urlValue), normalized, title]
+        [req.currentUser.id, ensureUrlProtocol(urlValue), normalized, title, notes, jobDescription]
       );
       if (rows[0]) results.push(rows[0]);
     }
@@ -1315,6 +1357,45 @@ router.post('/job-links/:linkId/open', async (req, res, next) => {
        WHERE id = $1 AND user_id = $2
        RETURNING *`,
       [req.params.linkId, req.currentUser.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/job-links/:linkId', async (req, res, next) => {
+  try {
+    const { title, notes, job_description } = req.body || {};
+    const updates: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    if (title !== undefined) {
+      updates.push(`title = $${paramIndex++}`);
+      values.push(title ? String(title).trim() : null);
+    }
+    if (notes !== undefined) {
+      updates.push(`notes = $${paramIndex++}`);
+      values.push(notes ? String(notes).trim() : null);
+    }
+    if (job_description !== undefined) {
+      updates.push(`job_description = $${paramIndex++}`);
+      values.push(job_description ? String(job_description).trim() : null);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'no_updates' });
+    }
+
+    values.push(req.params.linkId, req.currentUser.id);
+    const { rows } = await query(
+      `UPDATE job_links
+       SET ${updates.join(', ')}, updated_at = now()
+       WHERE id = $${paramIndex++} AND user_id = $${paramIndex++}
+       RETURNING *`,
+      values
     );
     if (rows.length === 0) return res.status(404).json({ error: 'not_found' });
     res.json(rows[0]);

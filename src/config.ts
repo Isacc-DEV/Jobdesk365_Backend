@@ -45,6 +45,30 @@ const corsOrigins = Array.from(
   new Set([defaultOrigin, ...(includeDevOrigins ? devOrigins : []), ...extraCorsOrigins])
 );
 
+const openAiApiKey = (process.env.OPENAI_API_KEY || '').trim();
+const huggingFaceApiKey = (process.env.HUGGINGFACE_API_KEY || process.env.HF_API_KEY || '').trim();
+const preferredAiProvider = (process.env.AI_PROVIDER || '').trim().toLowerCase();
+const forceHuggingFace = preferredAiProvider === 'huggingface';
+const forceOpenAi = preferredAiProvider === 'openai';
+
+const aiProvider: 'openai' | 'huggingface' = forceOpenAi
+  ? 'openai'
+  : forceHuggingFace || (!openAiApiKey && Boolean(huggingFaceApiKey))
+  ? 'huggingface'
+  : 'openai';
+
+const aiModel = aiProvider === 'huggingface'
+  ? process.env.HUGGINGFACE_MODEL || process.env.OPENAI_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
+  : process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+const aiBaseUrl = aiProvider === 'huggingface'
+  ? process.env.HUGGINGFACE_BASE_URL || 'https://router.huggingface.co/v1'
+  : process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+
+const aiApiKey = aiProvider === 'huggingface'
+  ? huggingFaceApiKey || openAiApiKey
+  : openAiApiKey || huggingFaceApiKey;
+
 export type Config = {
   port: number;
   frontendUrl: string;
@@ -76,11 +100,18 @@ export type Config = {
     model: string;
     baseUrl: string;
   };
+  ai: {
+    provider: 'openai' | 'huggingface';
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+  };
   supabase: {
     url: string;
     serviceRoleKey: string;
     avatarBucket: string;
   };
+  // Note: Supabase is optional, local file storage is used for avatars
 };
 
 export const config: Config = {
@@ -110,9 +141,15 @@ export const config: Config = {
     scopes: outlookScopes
   },
   openai: {
-    apiKey: process.env.OPENAI_API_KEY || '',
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    baseUrl: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
+    apiKey: aiApiKey,
+    model: aiModel,
+    baseUrl: aiBaseUrl
+  },
+  ai: {
+    provider: aiProvider,
+    apiKey: aiApiKey,
+    model: aiModel,
+    baseUrl: aiBaseUrl
   },
   supabase: {
     url: (process.env.SUPABASE_URL || '').trim(),

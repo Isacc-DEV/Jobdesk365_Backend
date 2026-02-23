@@ -223,25 +223,26 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
   const updates = [];
   const params = [];
+  const updateParamStart = allowAll ? 2 : 3;
 
   if (name !== undefined) {
-    updates.push(`name = $${updates.length + 3}`);
+    updates.push(`name = $${updates.length + updateParamStart}`);
     params.push(name);
   }
   if (description !== undefined) {
-    updates.push(`description = $${updates.length + 3}`);
+    updates.push(`description = $${updates.length + updateParamStart}`);
     params.push(description ?? null);
   }
   if (base_info !== undefined) {
-    updates.push(`base_info = COALESCE($${updates.length + 3}::jsonb, '{}'::jsonb)`);
+    updates.push(`base_info = COALESCE($${updates.length + updateParamStart}::jsonb, '{}'::jsonb)`);
     params.push(base_info);
   }
   if (base_resume !== undefined) {
-    updates.push(`base_resume = COALESCE($${updates.length + 3}::jsonb, '{}'::jsonb)`);
+    updates.push(`base_resume = COALESCE($${updates.length + updateParamStart}::jsonb, '{}'::jsonb)`);
     params.push(base_resume);
   }
   if (resume_template_id !== undefined) {
-    updates.push(`resume_template_id = $${updates.length + 3}`);
+    updates.push(`resume_template_id = $${updates.length + updateParamStart}`);
     params.push(resume_template_id);
   }
 

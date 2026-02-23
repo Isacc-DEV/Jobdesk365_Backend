@@ -7,7 +7,7 @@ const router = express.Router();
 const RESUME_GENERATE_COST = 0.04;
 const RESUME_REGENERATE_COST = 0.02;
 
-type OpenAiErrorResponse = {
+type AiErrorResponse = {
   error?: {
     message?: string;
     type?: string;
@@ -15,23 +15,25 @@ type OpenAiErrorResponse = {
   };
 };
 
-const buildOpenAiUrl = () => {
-  const base = config.openai.baseUrl.replace(/\/+$/, '');
+const buildAiUrl = () => {
+  const base = config.ai.baseUrl.replace(/\/+$/, '');
   return `${base}/chat/completions`;
 };
 
-const SYSTEM_PROMPT = `You are ResumeTailorJSON.
+const SYSTEM_PROMPT = `You are an expert resume writer and ResumeTailorJSON.
 
 TASK
-Given a Job Description (JD) and a Base Resume, output a minimal JSON object with:
+Given a Job Description (JD) and a Base Resume, output a JSON object with:
 - an updated headline aligned to the JD,
 - an updated summary aligned to the JD but grounded in the Base Resume,
-- skills_to_add (only if evidenced in the Base Resume),
-- NEW bullets to add for JD requirements that are MISSING or WEAKLY SUPPORTED,
-- a single match_score (0–100).
+- bullets that are either NEW (to add) or UPDATED (to replace existing ones).
 
-You must NOT rewrite, edit, or upgrade any existing base resume bullets.
-You may ONLY ADD new bullets.
+You rewrite resume bullet points to match a job description while maintaining truthfulness.
+For bullets, you can either:
+- ADD new bullets for JD requirements that are MISSING or WEAKLY SUPPORTED
+- UPDATE existing bullets to better align with JD requirements
+
+Output JSON only. Do not add commentary or markdown.
 
 ────────────────────────
 SPEED / OUTPUT LIMITS (HARD)
@@ -45,8 +47,10 @@ SPEED / OUTPUT LIMITS (HARD)
 ────────────────────────
 HEADLINE
 ────────────────────────
-- headline_new must align to the JD job title.
+- headline_new must align to the JD job title using professional title keywords.
+- Keep the headline concise (6-12 words) and truthful to the resume.
 - Do NOT add domains, tools, or specialties not supported by the Base Resume.
+- You may refine role titles for ATS clarity if supported by the resume content.
 
 ────────────────────────
 SUMMARY
@@ -58,25 +62,28 @@ SUMMARY
 ────────────────────────
 SKILLS
 ────────────────────────
-- skills_to_add must include ONLY skills that:
-  (a) are important for the JD AND
-  (b) are clearly evidenced in the Base Resume text.
-- Each skill item: { "skill": ""}
-- Do NOT include unsupported JD keywords.
+- Keep skills the same unless the job description strongly indicates updates.
+- Do NOT add credentials or claims not supported by the resume.
+- Skills are not included in the output (keep them unchanged from base resume).
 
 ────────────────────────
-EXPERIENCE — NEW BULLETS ONLY
+EXPERIENCE — BULLETS (NEW OR UPDATED)
 ────────────────────────
+- Keep the same number of experiences, order, and timelines as the Base Resume.
+- Do NOT invent new employers, roles, or timelines.
 - Internally extract up to 10–12 high-signal JD requirements.
 - For each requirement, estimate coverage from the Base Resume:
   - strong, weak, adjacent, missing
-- Generate new bullets ONLY for requirements that are:
-  - missing OR
-  - weak
-- Do NOT generate more than ONE new bullet per JD requirement across all companies.
+- For requirements that are missing or weak:
+  - If no existing bullet covers it: create a NEW bullet (type: "new")
+  - If an existing bullet partially covers it but could be improved: UPDATE that bullet (type: "updated" with original_index)
+- Generate ATS-optimized, professional bullets for each company.
+- Do NOT generate more than ONE bullet per JD requirement across all companies.
 - Distribute bullets across the most relevant companies (not only the most recent one).
 - Group bullets by company_index (based on company order in Base Resume, most recent = 0).
 - Do NOT output role titles or dates.
+- You may refine role titles and company names for ATS clarity if supported by the resume content, but do NOT invent new employers.
+- For "updated" bullets, specify the original_index (0-based) of the bullet you're replacing.
 
 ────────────────────────
 BULLET QUALITY RULES (CRITICAL)
@@ -109,19 +116,6 @@ OPENING PHRASE UNIQUENESS (INTERNAL ONLY — HARD)
 - Rewrite bullets internally until uniqueness is satisfied.
 - Do NOT output opening_phrase separately; output ONLY the final bullet sentence.
 
-────────────────────────
-MATCH SCORE (ONLY SCORE)
-────────────────────────
-- Coverage values:
-  - strong = 1.0
-  - weak = 0.6
-  - adjacent = 0.3
-  - missing = 0.0
-- Weight:
-  - must-like = 3
-  - preferred-like = 2
-- match_score = round(100 * sum(weight × coverage) / sum(weight))
-- Output ONLY the final match_score number.
 
 ────────────────────────
 OUTPUT FORMAT — JSON ONLY
@@ -129,31 +123,41 @@ OUTPUT FORMAT — JSON ONLY
 Return exactly one valid JSON object with this schema and NO extra keys:
 
 {
-  "schema_version": "2.4",
-  "match_score": 0,
-  "headline_new": "",
-  "summary_new": ["", "", ""],
-  "skills_to_add": [
-    { "skill": ""}
-  ],
-  "experience_bullets_to_add": [
+  "headline": "",
+  "summary": "",
+  "bullets": [
     {
       "company_index": 0,
       "bullets": [
         {
           "text": "",
-          "needs_input": false,
-          "needs_input_fields": []
+          "type": "new"
+        },
+        {
+          "text": "",
+          "type": "updated",
+          "original_index": 0
         }
       ]
     }
-  ],
-  "parsing_warnings": []
+  ]
 }
 
-If company bullet parsing or length matching is uncertain, add a short note to parsing_warnings and still produce best-effort output.`;
+IMPORTANT:
+- headline: Updated headline string (6-12 words, aligned to JD)
+- summary: Updated summary string (full text, 3-4 lines when formatted)
+- bullets: Array of bullet groups by company_index
+  - Each bullet must have "text" and "type"
+  - type: "new" for new bullets to add, "updated" for existing bullets to replace
+  - For "updated" bullets, include "original_index" (0-based index of the bullet in the original company's bullets array)
+  - Do NOT include bullets that remain unchanged
+
+If company bullet parsing or length matching is uncertain, still produce best-effort output.`;
 
 const buildUserPrompt = (jobDescription: string, baseResumeText: string) => `Tailor my resume to the JD using the system rules and return JSON only.
+
+Return updated headline, summary, and bullets (with type: "new" or "updated").
+For updated bullets, include the original_index of the bullet being replaced.
 
 JOB DESCRIPTION:
 <<<
@@ -164,7 +168,13 @@ BASE RESUME:
 <<<
 ${baseResumeText}
 >>>
-Return the tailored resume JSON now.`;
+
+Return JSON with:
+- headline: Updated headline string
+- summary: Updated summary string (full text)
+- bullets: Array of bullet groups with company_index, each bullet having text, type ("new" or "updated"), and original_index if type is "updated"
+
+Return the JSON now.`;
 
 const parseJsonFromText = (text: string) => {
   if (!text) return null;
@@ -184,11 +194,79 @@ const parseJsonFromText = (text: string) => {
   return null;
 };
 
+const buildUpdatedResume = (baseResume: any, updates: any) => {
+  // Start with a copy of base resume
+  const updated = typeof baseResume === 'string' 
+    ? JSON.parse(baseResume) 
+    : JSON.parse(JSON.stringify(baseResume));
+
+  // Update headline if provided
+  if (updates.headline && typeof updates.headline === 'string') {
+    if (updated.Profile) {
+      updated.Profile.headline = updates.headline;
+    } else {
+      updated.headline = updates.headline;
+      if (!updated.Profile) {
+        updated.Profile = { headline: updates.headline };
+      }
+    }
+  }
+
+  // Update summary if provided
+  if (updates.summary && typeof updates.summary === 'string') {
+    if (updated.summary && typeof updated.summary === 'object' && updated.summary !== null) {
+      updated.summary.text = updates.summary;
+    } else {
+      updated.summary = { text: updates.summary };
+    }
+  }
+
+  // Update bullets if provided
+  if (Array.isArray(updates.bullets)) {
+    const workExperience = updated.workExperience || updated.work_experience || [];
+    
+    updates.bullets.forEach((group: any) => {
+      const companyIndex = Number(group?.company_index);
+      if (!Number.isFinite(companyIndex) || companyIndex < 0 || companyIndex >= workExperience.length) {
+        return;
+      }
+
+      const company = workExperience[companyIndex];
+      if (!company) return;
+
+      // Ensure bullets array exists
+      if (!Array.isArray(company.bullets)) {
+        company.bullets = [];
+      }
+
+      // Process each bullet update
+      if (Array.isArray(group.bullets)) {
+        group.bullets.forEach((bulletUpdate: any) => {
+          if (!bulletUpdate?.text || !bulletUpdate?.type) return;
+
+          if (bulletUpdate.type === 'new') {
+            // Add new bullet
+            company.bullets.push(bulletUpdate.text);
+          } else if (bulletUpdate.type === 'updated' && typeof bulletUpdate.original_index === 'number') {
+            // Update existing bullet
+            const originalIndex = bulletUpdate.original_index;
+            if (originalIndex >= 0 && originalIndex < company.bullets.length) {
+              company.bullets[originalIndex] = bulletUpdate.text;
+            }
+          }
+        });
+      }
+    });
+  }
+
+  return updated;
+};
+
 router.use(authRequired, fetchCurrentUser);
 
 router.post('/resume-tailor', async (req, res, next) => {
-  if (!config.openai.apiKey) {
-    return res.status(503).json({ error: 'openai_not_configured' });
+  if (!config.ai.apiKey) {
+    return res.status(503).json({ error: 'ai_not_configured' });
   }
 
   const { job_description, profile_id } = req.body || {};
@@ -261,22 +339,31 @@ router.post('/resume-tailor', async (req, res, next) => {
       return res.status(400).json({ error: 'missing_job_description' });
     }
 
+    // Store baseResume for later use in buildUpdatedResume
+    const baseResumeForUpdate = typeof baseResume === 'string' 
+      ? JSON.parse(baseResume) 
+      : baseResume;
+
     const userPrompt = buildUserPrompt(trimmedJobDescription, baseResumeText || '{}');
-    const response = await fetch(buildOpenAiUrl(), {
+    const requestBody: Record<string, any> = {
+      model: config.ai.model,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.2
+    };
+    if (config.ai.provider === 'openai') {
+      requestBody.response_format = { type: 'json_object' };
+    }
+
+    const response = await fetch(buildAiUrl(), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${config.openai.apiKey}`,
+        Authorization: `Bearer ${config.ai.apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: config.openai.model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.2,
-        response_format: { type: 'json_object' }
-      })
+      body: JSON.stringify(requestBody)
     });
 
     const rawText = await response.text();
@@ -291,11 +378,11 @@ router.post('/resume-tailor', async (req, res, next) => {
     }
 
     if (!response.ok) {
-      const errorPayload = payload as OpenAiErrorResponse;
+      const errorPayload = payload as AiErrorResponse;
       const message =
-        errorPayload?.error?.message || 'OpenAI request failed.';
+        errorPayload?.error?.message || 'AI provider request failed.';
       await refundCharge();
-      return res.status(response.status).json({ error: 'openai_error', message });
+      return res.status(response.status).json({ error: 'ai_provider_error', message });
     }
 
     const content = payload?.choices?.[0]?.message?.content ?? '';
@@ -310,7 +397,13 @@ router.post('/resume-tailor', async (req, res, next) => {
       });
     }
 
-    return res.json(parsed);
+    // Generate updated resume from the AI response
+    const updatedResume = buildUpdatedResume(baseResumeForUpdate, parsed);
+
+    return res.json({
+      updates: parsed,
+      resume: updatedResume
+    });
   } catch (err) {
     await refundCharge();
     return next(err);

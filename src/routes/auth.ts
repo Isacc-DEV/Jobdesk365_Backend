@@ -3,7 +3,8 @@ import multer from 'multer';
 import jwt from 'jsonwebtoken';
 import type { SignOptions } from 'jsonwebtoken';
 import { randomUUID } from 'crypto';
-import { createClient } from '@supabase/supabase-js';
+import fs from 'fs/promises';
+import path from 'path';
 import { config } from '../config.js';
 import { query } from '../db.js';
 import { hashPassword, comparePassword } from '../utils/password.js';
@@ -13,18 +14,8 @@ const router = express.Router();
 const USERNAME_RE = /^[a-z0-9]+$/;
 const PLAN_VALUES = new Set(['free', 'plus', 'pro', 'pro_plus']);
 
-const hasSupabaseAvatarConfig =
-  Boolean(config.supabase.url) &&
-  Boolean(config.supabase.serviceRoleKey) &&
-  Boolean(config.supabase.avatarBucket);
-
-const supabase = hasSupabaseAvatarConfig
-  ? createClient(config.supabase.url, config.supabase.serviceRoleKey, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    })
-  : null;
-let avatarBucketEnsured = false;
-let avatarBucketEnsurePromise: Promise<void> | null = null;
+// Local file storage for avatars
+const AVATARS_DIR = path.resolve(process.cwd(), 'uploads', 'avatars');
 
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -73,36 +64,11 @@ function getAvatarExtension(file: Express.Multer.File) {
   return '.png';
 }
 
-async function ensureAvatarBucket() {
-  if (!supabase || avatarBucketEnsured) {
-    return;
-  }
-  if (avatarBucketEnsurePromise) {
-    return avatarBucketEnsurePromise;
-  }
-  avatarBucketEnsurePromise = (async () => {
-    const { data: existing, error: getError } = await supabase.storage.getBucket(config.supabase.avatarBucket);
-    if (!getError && existing?.name) {
-      avatarBucketEnsured = true;
-      return;
-    }
-
-    const { error: createError } = await supabase.storage.createBucket(config.supabase.avatarBucket, {
-      public: true,
-      fileSizeLimit: 5 * 1024 * 1024,
-      allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-    });
-
-    if (createError && !/already exists/i.test(createError.message || '')) {
-      throw new Error(createError.message || 'Unable to initialize avatar bucket.');
-    }
-    avatarBucketEnsured = true;
-  })();
-
+async function ensureAvatarsDirectory() {
   try {
-    await avatarBucketEnsurePromise;
-  } finally {
-    avatarBucketEnsurePromise = null;
+    await fs.access(AVATARS_DIR);
+  } catch {
+    await fs.mkdir(AVATARS_DIR, { recursive: true });
   }
 }
 
@@ -200,38 +166,18 @@ router.post('/me/avatar', authRequired, (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ error: 'missing_file' });
     }
-    if (!supabase) {
-      return res.status(500).json({
-        error: 'supabase_not_configured',
-        message: 'SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured.'
-      });
-    }
     try {
-      await ensureAvatarBucket();
+      await ensureAvatarsDirectory();
 
       const ext = getAvatarExtension(req.file);
-      const objectPath = `users/${req.user?.id || 'user'}/${Date.now()}-${randomUUID()}${ext}`;
+      const fileName = `${req.user?.id || 'user'}-${Date.now()}-${randomUUID()}${ext}`;
+      const filePath = path.join(AVATARS_DIR, fileName);
 
-      const { error: uploadError } = await supabase.storage
-        .from(config.supabase.avatarBucket)
-        .upload(objectPath, req.file.buffer, {
-          cacheControl: '31536000',
-          contentType: req.file.mimetype || 'application/octet-stream',
-          upsert: true
-        });
+      // Write file to local storage
+      await fs.writeFile(filePath, req.file.buffer);
 
-      if (uploadError) {
-        return res.status(500).json({ error: 'upload_failed', message: uploadError.message });
-      }
-
-      const { data: publicUrlData } = supabase.storage
-        .from(config.supabase.avatarBucket)
-        .getPublicUrl(objectPath);
-
-      const photoLink = publicUrlData?.publicUrl || '';
-      if (!photoLink) {
-        return res.status(500).json({ error: 'upload_failed', message: 'Unable to resolve avatar URL.' });
-      }
+      // Generate public URL (server serves /uploads as static)
+      const photoLink = `/uploads/avatars/${fileName}`;
 
       await query(
         `UPDATE users
