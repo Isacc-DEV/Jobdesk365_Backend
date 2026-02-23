@@ -40,29 +40,61 @@ function parseLimit(value: unknown): number {
 }
 
 const getFrontendOrigin = (): string => {
+  const origin = toOrigin(config.frontendUrl);
+  return origin || '*';
+};
+
+const toOrigin = (value: unknown): string | null => {
+  if (typeof value !== 'string' || !value.trim()) return null;
   try {
-    return new URL(config.frontendUrl).origin;
+    return new URL(value).origin;
   } catch (err) {
-    return '*';
+    return null;
   }
 };
+
+const isAllowedFrontendOrigin = (origin: string): boolean => {
+  if (origin === '*') return true;
+  if (config.cors.allowAll) return true;
+  if (origin === getFrontendOrigin()) return true;
+  return config.cors.origins.includes(origin);
+};
+
+const resolveFrontendOrigin = (input?: string | null): string => {
+  const requested = toOrigin(input);
+  if (requested && isAllowedFrontendOrigin(requested)) {
+    return requested;
+  }
+  return getFrontendOrigin();
+};
+
+const escapeHtml = (value: string): string =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 
 type CallbackPageInput = {
   status: 'success' | 'error';
   profileId?: string | null;
   message?: string | null;
+  frontendOrigin?: string | null;
 };
 
-const renderCallbackPage = ({ status, profileId, message }: CallbackPageInput): string => {
-  const frontendOrigin = getFrontendOrigin();
+const renderCallbackPage = ({ status, profileId, message, frontendOrigin }: CallbackPageInput): string => {
+  const targetOrigin = resolveFrontendOrigin(frontendOrigin);
   const payload = {
     type: status === 'success' ? 'email_connected' : 'email_connect_error',
     profileId: profileId || null,
     message: message || null
   };
   const safePayload = JSON.stringify(payload);
-  const safeOrigin = JSON.stringify(frontendOrigin);
-  const safeMessage = message || (status === 'success' ? 'Email connected.' : 'Email connection failed.');
+  const safeOrigin = JSON.stringify(targetOrigin);
+  const safeMessage = escapeHtml(
+    message || (status === 'success' ? 'Email connected.' : 'Email connection failed.')
+  );
 
   return `<!doctype html>
 <html>
@@ -87,7 +119,14 @@ const renderCallbackPage = ({ status, profileId, message }: CallbackPageInput): 
         const payload = ${safePayload};
         const origin = ${safeOrigin};
         if (window.opener && window.opener !== window) {
-          window.opener.postMessage(payload, origin);
+          try {
+            window.opener.postMessage(payload, origin);
+          } catch (err) {}
+          if (origin !== "*") {
+            try {
+              window.opener.postMessage(payload, "*");
+            } catch (err) {}
+          }
           window.close();
         }
       })();
@@ -693,7 +732,7 @@ router.get('/outlook/callback', async (req, res, next) => {
       .send(renderCallbackPage({ status: 'error', message: 'Outlook integration not configured.' }));
   }
 
-  let payload;
+  let payload: any;
   try {
     payload = jwt.verify(state, config.jwt.secret);
   } catch (err) {
@@ -702,10 +741,18 @@ router.get('/outlook/callback', async (req, res, next) => {
       .send(renderCallbackPage({ status: 'error', message: 'Invalid state token.' }));
   }
 
+  const callbackOrigin = resolveFrontendOrigin(payload?.frontend_origin);
+
   if (payload?.purpose !== 'outlook_connect' || !payload?.profile_id || !payload?.user_id) {
     return res
       .status(400)
-      .send(renderCallbackPage({ status: 'error', message: 'Invalid state payload.' }));
+      .send(
+        renderCallbackPage({
+          status: 'error',
+          message: 'Invalid state payload.',
+          frontendOrigin: callbackOrigin
+        })
+      );
   }
 
   try {
@@ -723,7 +770,9 @@ router.get('/outlook/callback', async (req, res, next) => {
     const tokenData = await fetchJson(tokenResponse);
     if (!tokenResponse.ok) {
       const message = tokenData.error_description || tokenData.error || 'Token exchange failed.';
-      return res.status(400).send(renderCallbackPage({ status: 'error', message }));
+      return res
+        .status(400)
+        .send(renderCallbackPage({ status: 'error', message, frontendOrigin: callbackOrigin }));
     }
 
     const accessToken = tokenData.access_token;
@@ -737,7 +786,13 @@ router.get('/outlook/callback', async (req, res, next) => {
     if (!accessToken) {
       return res
         .status(400)
-        .send(renderCallbackPage({ status: 'error', message: 'Missing access token.' }));
+        .send(
+          renderCallbackPage({
+            status: 'error',
+            message: 'Missing access token.',
+            frontendOrigin: callbackOrigin
+          })
+        );
     }
 
     const meResponse = await fetch('https://graph.microsoft.com/v1.0/me', {
@@ -748,7 +803,9 @@ router.get('/outlook/callback', async (req, res, next) => {
     const meData = await fetchJson(meResponse);
     if (!meResponse.ok) {
       const message = meData.error?.message || 'Unable to fetch Outlook profile.';
-      return res.status(400).send(renderCallbackPage({ status: 'error', message }));
+      return res
+        .status(400)
+        .send(renderCallbackPage({ status: 'error', message, frontendOrigin: callbackOrigin }));
     }
 
     const emailAddress = meData.mail || meData.userPrincipalName || '';
@@ -768,7 +825,13 @@ router.get('/outlook/callback', async (req, res, next) => {
         await client.query('ROLLBACK');
         return res
           .status(404)
-          .send(renderCallbackPage({ status: 'error', message: 'Profile not found.' }));
+          .send(
+            renderCallbackPage({
+              status: 'error',
+              message: 'Profile not found.',
+              frontendOrigin: callbackOrigin
+            })
+          );
       }
 
       let emailAccountId = rows[0].email_account_id;
@@ -814,7 +877,11 @@ router.get('/outlook/callback', async (req, res, next) => {
     }
 
     return res.send(
-      renderCallbackPage({ status: 'success', profileId: payload.profile_id })
+      renderCallbackPage({
+        status: 'success',
+        profileId: payload.profile_id,
+        frontendOrigin: callbackOrigin
+      })
     );
   } catch (err) {
     next(err);

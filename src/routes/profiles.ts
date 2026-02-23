@@ -51,6 +51,15 @@ function buildOutlookAuthorizeUrl(state: string): string {
   return `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
 }
 
+function toOrigin(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    return new URL(value).origin;
+  } catch (err) {
+    return null;
+  }
+}
+
 const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   const router = express.Router();
   const allowAll = mode !== 'user';
@@ -403,7 +412,8 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
       {
         purpose: 'outlook_connect',
         profile_id: req.params.profileId,
-        user_id: req.currentUser.id
+        user_id: req.currentUser.id,
+        frontend_origin: toOrigin(req.get('origin'))
       },
       config.jwt.secret,
       { expiresIn: '10m' }
