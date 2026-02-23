@@ -45,6 +45,7 @@ function buildOutlookAuthorizeUrl(state: string): string {
     redirect_uri: config.outlook.redirectUri,
     response_mode: 'query',
     scope: config.outlook.scopes.join(' '),
+    prompt: 'login',
     state
   });
   return `https://login.microsoftonline.com/${config.outlook.tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
