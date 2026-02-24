@@ -1,4 +1,5 @@
 import express from 'express';
+import { chromium, type Browser } from 'playwright';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyResumeTemplateAdded } from '../services/notifications.js';
@@ -9,6 +10,15 @@ router.use(authRequired, fetchCurrentUser);
 
 const isAdminOrManager = (roles?: string[] | null) =>
   Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+
+const buildSafePdfFilename = (value?: string) => {
+  const base =
+    String(value || 'resume')
+      .trim()
+      .replace(/[\\/:*?"<>|]+/g, '-')
+      .replace(/\s+/g, ' ') || 'resume';
+  return base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
+};
 
 // List resume templates for all authenticated users
 router.get('/', async (req, res, next) => {
@@ -59,6 +69,94 @@ router.post('/', async (req, res, next) => {
     return res.status(201).json(rows[0]);
   } catch (err) {
     next(err);
+  }
+});
+
+// Render template HTML to a one-page PDF sized to the content canvas.
+router.post('/render-pdf', async (req, res) => {
+  const html = typeof req.body?.html === 'string' ? req.body.html.trim() : '';
+  const fileName = buildSafePdfFilename(req.body?.filename);
+
+  if (!html) {
+    return res.status(400).json({ error: 'missing_html' });
+  }
+  if (html.length > 2_000_000) {
+    return res.status(413).json({ error: 'template_too_large' });
+  }
+
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1240, height: 1754 } });
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    await page.emulateMedia({ media: 'screen' });
+
+    const size = await page.evaluate(() => {
+      const body = document.body;
+      const doc = document.documentElement;
+      const candidates = body ? Array.from(body.children) : [];
+      let target: Element = body || doc;
+      let bestArea = 0;
+
+      for (const element of candidates) {
+        const rect = element.getBoundingClientRect();
+        const area = rect.width * rect.height;
+        if (area > bestArea) {
+          bestArea = area;
+          target = element;
+        }
+      }
+
+      const targetEl = target as HTMLElement;
+      if (targetEl?.style) {
+        targetEl.style.margin = '0';
+      }
+      if (doc?.style) {
+        doc.style.margin = '0';
+        doc.style.padding = '0';
+      }
+      if (body?.style) {
+        body.style.margin = '0';
+        body.style.padding = '0';
+      }
+
+      const rect = target.getBoundingClientRect();
+      const width = Math.max(1, Math.ceil(rect.width));
+      const height = Math.max(1, Math.ceil(rect.height));
+
+      if (body?.style) {
+        body.style.width = `${width}px`;
+        body.style.height = `${height}px`;
+        body.style.overflow = 'hidden';
+      }
+      if (doc?.style) {
+        doc.style.width = `${width}px`;
+        doc.style.height = `${height}px`;
+        doc.style.overflow = 'hidden';
+      }
+
+      return { width, height };
+    });
+
+    const pdfWidth = Math.max(1, Math.ceil(size.width));
+    const pdfHeight = Math.max(1, Math.ceil(size.height));
+    const pdf = await page.pdf({
+      width: `${pdfWidth}px`,
+      height: `${pdfHeight}px`,
+      printBackground: true,
+      margin: { top: '0mm', bottom: '0mm', left: '0mm', right: '0mm' }
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    return res.send(pdf);
+  } catch (err) {
+    console.error('[templates] render-pdf failed', err);
+    return res.status(500).json({ error: 'pdf_render_failed' });
+  } finally {
+    if (browser) {
+      await browser.close().catch(() => undefined);
+    }
   }
 });
 

@@ -187,19 +187,40 @@ router.get('/accounts', authRequired, fetchCurrentUser, requireScopeAccess, asyn
 });
 
 router.get('/events', authRequired, fetchCurrentUser, requireScopeAccess, async (req, res, next) => {
+  const { allowAll } = getScopeContext(req);
   const accountId = typeof req.query?.account_id === 'string' ? req.query.account_id : null;
-  if (!accountId) {
+  const assignedOnlyRaw = req.query?.assigned_only;
+  const assignedOnly =
+    !allowAll &&
+    (assignedOnlyRaw === '1' ||
+      assignedOnlyRaw === 'true' ||
+      assignedOnlyRaw === 'yes');
+
+  if (!accountId && !assignedOnly) {
     return res.status(400).json({ error: 'missing_account_id' });
   }
   const limit = parseLimit(req.query?.limit);
   const start = parseDate(req.query?.start);
   const end = parseDate(req.query?.end);
 
-  const { allowAll } = getScopeContext(req);
-  const filters = allowAll
-    ? ['p.deleted_at IS NULL', 'ce.email_account_id = $1']
-    : ['(p.user_id = $1 OR ce.assigned_user_id = $1)', 'p.deleted_at IS NULL', 'ce.email_account_id = $2'];
-  const params: Array<string | number | Date> = allowAll ? [accountId] : [req.currentUser.id, accountId];
+  const filters: string[] = ['p.deleted_at IS NULL'];
+  const params: Array<string | number | Date> = [];
+  if (allowAll) {
+    if (!accountId) {
+      return res.status(400).json({ error: 'missing_account_id' });
+    }
+    params.push(accountId);
+    filters.push('ce.email_account_id = $1');
+  } else {
+    params.push(req.currentUser.id);
+    if (assignedOnly) {
+      filters.push('ce.assigned_user_id = $1');
+    } else {
+      filters.push('(p.user_id = $1 OR ce.assigned_user_id = $1)');
+      params.push(accountId as string);
+      filters.push('ce.email_account_id = $2');
+    }
+  }
   let idx = params.length;
 
   if (start) {
