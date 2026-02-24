@@ -18,6 +18,30 @@ const normalizeRateForRole = (role: TalentRole, rawRate: unknown): number => {
   return Math.round(parsed * 100) / 100;
 };
 
+const resolveTalentRateForRole = async (
+  client: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
+  role: TalentRole,
+  candidateUserIds: Array<string | null | undefined>
+): Promise<number | null> => {
+  const seen = new Set<string>();
+  for (const rawUserId of candidateUserIds) {
+    const userId = rawUserId ? String(rawUserId) : '';
+    if (!userId || seen.has(userId)) continue;
+    seen.add(userId);
+    const { rows } = await client.query(
+      `SELECT t.rate
+       FROM talents t
+       WHERE COALESCE(t.user_id, t.id) = $1
+         AND t.talent_role = $2
+       LIMIT 1`,
+      [userId, role]
+    );
+    if (!rows.length) continue;
+    return normalizeRateForRole(role, rows[0].rate);
+  }
+  return null;
+};
+
 const DEFAULT_SUCCESS_LABELS = [
   'thank you for applying',
   'application received',
@@ -1184,21 +1208,12 @@ const upsertApplication = async (req, res, next) => {
     const assignedBidderId = profileRows[0].assigned_bidder_user_id
       ? String(profileRows[0].assigned_bidder_user_id)
       : null;
-    let applicationCost = getRoleBaseRate('bidder');
-
-    if (assignedBidderId) {
-      const { rows: bidderRateRows } = await client.query(
-        `SELECT t.rate
-         FROM talents t
-         WHERE COALESCE(t.user_id, t.id) = $1
-           AND t.talent_role = 'bidder'
-         LIMIT 1`,
-        [assignedBidderId]
-      );
-      if (bidderRateRows.length > 0) {
-        applicationCost = normalizeRateForRole('bidder', bidderRateRows[0].rate);
-      }
-    }
+    const resolvedBidderRate = await resolveTalentRateForRole(client, 'bidder', [
+      assignedBidderId,
+      req.currentUser.id,
+      ownerId
+    ]);
+    const applicationCost = resolvedBidderRate ?? getRoleBaseRate('bidder');
 
     const existing = await client.query(
       `SELECT id, bids
