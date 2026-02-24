@@ -1,4 +1,8 @@
 import express from 'express';
+import multer from 'multer';
+import fs from 'fs/promises';
+import path from 'path';
+import { randomUUID } from 'crypto';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import {
@@ -12,6 +16,11 @@ import {
 
 const router = express.Router();
 type RouteScope = 'user' | 'manager' | 'admin';
+type TalentRole = 'bidder' | 'caller';
+
+const BIDDER_BASE_RATE = 0.07;
+const CALLER_BASE_RATE = 0.5;
+const TALENT_IMAGES_DIR = path.resolve(process.cwd(), 'uploads', 'talents');
 
 const hasRole = (roles: string[] | null | undefined, role: string) =>
   Array.isArray(roles) && roles.includes(role);
@@ -37,6 +46,70 @@ const requireScopeAccess: express.RequestHandler = (req, res, next) => {
     return res.status(403).json({ error: 'manager_required' });
   }
   return next();
+};
+
+const roundRate = (value: number): number => Math.round(value * 100) / 100;
+
+const getRoleBaseRate = (role: TalentRole): number =>
+  role === 'caller' ? CALLER_BASE_RATE : BIDDER_BASE_RATE;
+
+const normalizeRateForRole = (role: TalentRole, rawRate: unknown): number => {
+  const parsed = Number(rawRate);
+  if (!Number.isFinite(parsed) || parsed < 0) return getRoleBaseRate(role);
+  return roundRate(parsed);
+};
+
+const resolveAssigneeRate = async (assigneeUserId: string, role: TalentRole): Promise<number | null> => {
+  const { rows } = await query(
+    `SELECT t.rate
+     FROM talents t
+     WHERE COALESCE(t.user_id, t.id) = $1
+       AND t.talent_role = $2
+     LIMIT 1`,
+    [assigneeUserId, role]
+  );
+  if (!rows.length) return null;
+  return normalizeRateForRole(role, rows[0].rate);
+};
+
+const toNullableTrimmed = (value: unknown): string | null => {
+  if (value === null || value === undefined) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+};
+
+const talentImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith('image/')) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('invalid_file_type'));
+  }
+}).single('image');
+
+const getImageExtension = (file: Express.Multer.File) => {
+  const originalExt = (file.originalname?.match(/\.[^.]+$/)?.[0] || '').toLowerCase();
+  const safeOriginalExt = originalExt.replace(/[^a-z0-9.]/g, '').slice(0, 10);
+  if (safeOriginalExt) {
+    return safeOriginalExt;
+  }
+  const mime = (file.mimetype || '').toLowerCase();
+  if (mime === 'image/jpeg') return '.jpg';
+  if (mime === 'image/png') return '.png';
+  if (mime === 'image/gif') return '.gif';
+  if (mime === 'image/webp') return '.webp';
+  return '.png';
+};
+
+const ensureTalentImagesDirectory = async () => {
+  try {
+    await fs.access(TALENT_IMAGES_DIR);
+  } catch {
+    await fs.mkdir(TALENT_IMAGES_DIR, { recursive: true });
+  }
 };
 
 let hireSchemaPromise: Promise<void> | null = null;
@@ -193,7 +266,7 @@ const ensureHireSchema = async () => {
              NULL,
              NULL,
              NULL,
-             CASE WHEN r.key = 'caller' THEN 35 ELSE 3 END,
+             CASE WHEN r.key = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END,
              NULL
       FROM users u
       JOIN user_roles ur ON ur.user_id = u.id
@@ -206,12 +279,12 @@ const ensureHireSchema = async () => {
       `
       WITH mock_talents (email, username, display_name, bio, role_key, rate, img_url, phone_number, whatsapp, telegram, skill) AS (
         VALUES
-          ('mock.caller1@jobdesk.local', 'caller.one', 'Callie Stone', 'Customer-focused caller with a calm tone.', 'caller', 32, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-1.jpg', '555-0101', '555-0101', 'caller.one', 'Outbound calling'),
-          ('mock.caller2@jobdesk.local', 'caller.two', 'Noah Reed', 'Fast, friendly outreach and follow-up specialist.', 'caller', 28, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-2.jpg', '555-0102', '555-0102', 'caller.two', 'Lead follow-up'),
-          ('mock.caller3@jobdesk.local', 'caller.three', 'Ava Brooks', 'Empathetic caller with experience in pipelines.', 'caller', 30, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-3.jpg', '555-0103', '555-0103', 'caller.three', 'Pipeline outreach'),
-          ('mock.bidder1@jobdesk.local', 'bidder.one', 'Ethan Park', 'High-volume application specialist.', 'bidder', 4, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-1.jpg', '555-0201', '555-0201', 'bidder.one', 'Applications'),
-          ('mock.bidder2@jobdesk.local', 'bidder.two', 'Mia Patel', 'Accurate and fast bidder with ATS expertise.', 'bidder', 5, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-2.jpg', '555-0202', '555-0202', 'bidder.two', 'ATS bids'),
-          ('mock.bidder3@jobdesk.local', 'bidder.three', 'Lucas Ortiz', 'Detail-oriented application optimizer.', 'bidder', 3, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-3.jpg', '555-0203', '555-0203', 'bidder.three', 'Application targeting')
+          ('mock.caller1@jobdesk.local', 'caller.one', 'Callie Stone', 'Customer-focused caller with a calm tone.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-1.jpg', '555-0101', '555-0101', 'caller.one', 'Outbound calling'),
+          ('mock.caller2@jobdesk.local', 'caller.two', 'Noah Reed', 'Fast, friendly outreach and follow-up specialist.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-2.jpg', '555-0102', '555-0102', 'caller.two', 'Lead follow-up'),
+          ('mock.caller3@jobdesk.local', 'caller.three', 'Ava Brooks', 'Empathetic caller with experience in pipelines.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-3.jpg', '555-0103', '555-0103', 'caller.three', 'Pipeline outreach'),
+          ('mock.bidder1@jobdesk.local', 'bidder.one', 'Ethan Park', 'High-volume application specialist.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-1.jpg', '555-0201', '555-0201', 'bidder.one', 'Applications'),
+          ('mock.bidder2@jobdesk.local', 'bidder.two', 'Mia Patel', 'Accurate and fast bidder with ATS expertise.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-2.jpg', '555-0202', '555-0202', 'bidder.two', 'ATS bids'),
+          ('mock.bidder3@jobdesk.local', 'bidder.three', 'Lucas Ortiz', 'Detail-oriented application optimizer.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-3.jpg', '555-0203', '555-0203', 'bidder.three', 'Application targeting')
       ),
       ensured_users AS (
         INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan)
@@ -265,6 +338,33 @@ const ensureHireSchema = async () => {
       `,
       ['$2b$10$N9qo8uLOickgx2ZMRZo5e.Puq8No3BFEtGYwd5j9Vn0iJrO9wBLs.']
     );
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS app_data_migrations (
+        key text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    const rateResetMigration = await query(
+      `INSERT INTO app_data_migrations (key)
+       VALUES ($1)
+       ON CONFLICT (key) DO NOTHING`,
+      ['2026-02-24-reset-talent-rates-to-role-base']
+    );
+
+    if ((rateResetMigration.rowCount || 0) > 0) {
+      await query(
+        `UPDATE talents
+         SET rate = CASE
+           WHEN talent_role = 'bidder' THEN $1
+           WHEN talent_role = 'caller' THEN $2
+           ELSE rate
+         END
+         WHERE talent_role IN ('bidder', 'caller')`,
+        [BIDDER_BASE_RATE, CALLER_BASE_RATE]
+      );
+    }
 
     await query(`
       CREATE TABLE IF NOT EXISTS requests (
@@ -350,7 +450,7 @@ router.use(async (_req, _res, next) => {
   }
 });
 
-const formatRole = (value?: string) => {
+const formatRole = (value?: string): TalentRole | null => {
   if (!value) return null;
   const normalized = String(value).toLowerCase();
   if (normalized === 'bidder' || normalized === 'caller') return normalized;
@@ -423,7 +523,10 @@ const listTalents = async (req, res, next) => {
               t.phone_number,
               t.whatsapp,
               t.telegram,
-              t.rate,
+              COALESCE(
+                t.rate,
+                CASE WHEN t.talent_role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+              ) AS rate,
               t.img_url
        FROM talents t
        JOIN users u ON u.id = COALESCE(t.user_id, t.id)
@@ -472,6 +575,12 @@ router.post('/talents', async (req, res, next) => {
   const payload = req.body || {};
   const role = formatRole(payload.role);
   if (!role) return res.status(400).json({ error: 'invalid_role' });
+  const hasExplicitRate = payload.rate !== undefined && payload.rate !== null && payload.rate !== '';
+  const parsedRate = hasExplicitRate ? Number(payload.rate) : null;
+  if (hasExplicitRate && (!Number.isFinite(parsedRate) || parsedRate < 0)) {
+    return res.status(400).json({ error: 'invalid_rate' });
+  }
+  const resolvedRate = hasExplicitRate ? roundRate(parsedRate as number) : getRoleBaseRate(role);
 
   const rawUserId = payload.user_id ? String(payload.user_id) : '';
   const identity = String(payload.email || payload.username || '').trim();
@@ -563,8 +672,8 @@ router.post('/talents', async (req, res, next) => {
         payload.phone_number ?? null,
         payload.whatsapp ?? null,
         payload.telegram ?? null,
-        payload.rate ?? null,
-        payload.img_url ?? null
+        resolvedRate,
+        toNullableTrimmed(payload.img_url)
       ]
     );
 
@@ -572,6 +681,175 @@ router.post('/talents', async (req, res, next) => {
       notifyTalentAdded({ talentUserId: userId, talentRole: role })
     );
     return res.status(201).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/talents/me', async (req, res, next) => {
+  const payload = req.body || {};
+  const role = formatRole(payload.role);
+  if (!role) return res.status(400).json({ error: 'invalid_role' });
+
+  const updates: string[] = [];
+  const params: unknown[] = [req.currentUser.id, role];
+  let idx = params.length;
+  const addField = (column: string, value: unknown) => {
+    idx += 1;
+    updates.push(`${column} = $${idx}`);
+    params.push(value);
+  };
+
+  if (payload.bio !== undefined) {
+    addField('bio', toNullableTrimmed(payload.bio));
+  }
+
+  if (!updates.length) {
+    return res.status(400).json({ error: 'no_fields_to_update' });
+  }
+
+  try {
+    const { rows } = await query(
+      `UPDATE talents
+       SET ${updates.join(', ')}
+       WHERE COALESCE(user_id, id) = $1
+         AND talent_role = $2
+       RETURNING id,
+                 COALESCE(user_id, id) AS user_id,
+                 talent_role AS role,
+                 name,
+                 bio,
+                 skill,
+                 email,
+                 phone_number,
+                 whatsapp,
+                 telegram,
+                 COALESCE(
+                   rate,
+                   CASE WHEN talent_role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+                 ) AS rate,
+                 img_url`,
+      params
+    );
+    if (!rows.length) return res.status(404).json({ error: 'talent_not_found' });
+    return res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/talents/me/image', (req, res, next) => {
+  talentImageUpload(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ error: 'upload_failed', message: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'missing_file' });
+    }
+    const role = formatRole(req.body?.role);
+    if (!role) {
+      return res.status(400).json({ error: 'invalid_role' });
+    }
+
+    try {
+      await ensureTalentImagesDirectory();
+      const ext = getImageExtension(req.file);
+      const fileName = `${req.currentUser.id}-${role}-${Date.now()}-${randomUUID()}${ext}`;
+      const filePath = path.join(TALENT_IMAGES_DIR, fileName);
+      await fs.writeFile(filePath, req.file.buffer);
+
+      const imagePath = `/uploads/talents/${fileName}`;
+      const { rows } = await query(
+        `UPDATE talents
+         SET img_url = $3
+         WHERE COALESCE(user_id, id) = $1
+           AND talent_role = $2
+         RETURNING id,
+                   COALESCE(user_id, id) AS user_id,
+                   talent_role AS role,
+                   name,
+                   bio,
+                   skill,
+                   email,
+                   phone_number,
+                   whatsapp,
+                   telegram,
+                   COALESCE(
+                     rate,
+                     CASE WHEN talent_role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+                   ) AS rate,
+                   img_url`,
+        [req.currentUser.id, role, imagePath]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ error: 'talent_not_found' });
+      }
+      return res.json(rows[0]);
+    } catch (uploadErr) {
+      return next(uploadErr);
+    }
+  });
+});
+
+router.patch('/talents/:userId', async (req, res, next) => {
+  if (!hasRole(req.currentUser?.roles, 'admin')) {
+    return res.status(403).json({ error: 'admin_required' });
+  }
+
+  const payload = req.body || {};
+  const role = formatRole(payload.role);
+  if (!role) return res.status(400).json({ error: 'invalid_role' });
+  if (payload.bio !== undefined || payload.img_url !== undefined) {
+    return res.status(400).json({ error: 'admin_price_only' });
+  }
+  if (payload.rate === undefined || payload.rate === null || payload.rate === '') {
+    return res.status(400).json({ error: 'rate_required' });
+  }
+
+  const updates: string[] = [];
+  const params: unknown[] = [req.params.userId, role];
+  let idx = params.length;
+  const addField = (column: string, value: unknown) => {
+    idx += 1;
+    updates.push(`${column} = $${idx}`);
+    params.push(value);
+  };
+
+  const parsedRate = Number(payload.rate);
+  if (!Number.isFinite(parsedRate) || parsedRate < 0) {
+    return res.status(400).json({ error: 'invalid_rate' });
+  }
+  addField('rate', roundRate(parsedRate));
+
+  if (!updates.length) {
+    return res.status(400).json({ error: 'no_fields_to_update' });
+  }
+
+  try {
+    const { rows } = await query(
+      `UPDATE talents
+       SET ${updates.join(', ')}
+       WHERE COALESCE(user_id, id) = $1
+         AND talent_role = $2
+       RETURNING id,
+                 COALESCE(user_id, id) AS user_id,
+                 talent_role AS role,
+                 name,
+                 bio,
+                 skill,
+                 email,
+                 phone_number,
+                 whatsapp,
+                 telegram,
+                 COALESCE(
+                   rate,
+                   CASE WHEN talent_role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+                 ) AS rate,
+                 img_url`,
+      params
+    );
+    if (!rows.length) return res.status(404).json({ error: 'talent_not_found' });
+    return res.json(rows[0]);
   } catch (err) {
     next(err);
   }
@@ -597,7 +875,10 @@ router.get('/requests', async (req, res, next) => {
               r.role,
               r.detail,
               r.assignee_user_id,
-              r.hourly_rate,
+              COALESCE(
+                r.hourly_rate,
+                CASE WHEN r.role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+              ) AS hourly_rate,
               r.when_at,
               r.status,
               r.archived,
@@ -645,17 +926,11 @@ router.post('/requests', async (req, res, next) => {
     }
 
     if (assigneeId) {
-      const rateQuery = await query(
-        `SELECT t.rate
-         FROM talents t
-         WHERE COALESCE(t.user_id, t.id) = $1 AND t.talent_role = $2`,
-        [assigneeId, role]
-      );
-      if (!rateQuery.rows.length) {
+      const assigneeRate = await resolveAssigneeRate(assigneeId, role);
+      if (assigneeRate === null) {
         return res.status(400).json({ error: 'assignee_not_found' });
       }
-      const rateValue = rateQuery.rows[0].rate;
-      hourlyRate = rateValue === null || rateValue === undefined ? null : Number(rateValue);
+      hourlyRate = assigneeRate;
     }
 
     const { rows } = await query(
@@ -734,21 +1009,21 @@ router.patch('/requests/:requestId', async (req, res, next) => {
       const nextAssigneeId = payload.assignee_user_id ? String(payload.assignee_user_id) : null;
       let rateValue: number | null = null;
       if (nextAssigneeId) {
-        const rateResult = await query(
-          `SELECT t.rate
-           FROM talents t
-           WHERE COALESCE(t.user_id, t.id) = $1 AND t.talent_role = $2`,
-          [nextAssigneeId, nextRole]
-        );
-        if (!rateResult.rows.length) {
+        const assigneeRate = await resolveAssigneeRate(nextAssigneeId, nextRole);
+        if (assigneeRate === null) {
           return res.status(400).json({ error: 'assignee_not_found' });
         }
-        const rawRate = rateResult.rows[0].rate;
-        rateValue = rawRate === null || rawRate === undefined ? null : Number(rawRate);
+        rateValue = assigneeRate;
       }
 
       addField('assignee_user_id', nextAssigneeId);
       addField('hourly_rate', rateValue);
+    } else if (payload.role !== undefined && existing.assignee_user_id) {
+      const existingAssigneeRate = await resolveAssigneeRate(String(existing.assignee_user_id), nextRole);
+      if (existingAssigneeRate === null) {
+        return res.status(400).json({ error: 'assignee_not_found' });
+      }
+      addField('hourly_rate', existingAssigneeRate);
     }
 
     if (payload.when_at !== undefined) {

@@ -5,6 +5,19 @@ import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
 type RouteScope = 'user' | 'manager' | 'admin';
+type TalentRole = 'bidder' | 'caller';
+
+const BIDDER_BASE_RATE = 0.07;
+const CALLER_BASE_RATE = 0.5;
+
+const getRoleBaseRate = (role: TalentRole): number =>
+  role === 'caller' ? CALLER_BASE_RATE : BIDDER_BASE_RATE;
+
+const normalizeRateForRole = (role: TalentRole, rawRate: unknown): number => {
+  const parsed = Number(rawRate);
+  if (!Number.isFinite(parsed) || parsed < 0) return getRoleBaseRate(role);
+  return Math.round(parsed * 100) / 100;
+};
 
 const hasRole = (roles: string[] | null | undefined, role: string) =>
   Array.isArray(roles) && roles.includes(role);
@@ -263,6 +276,7 @@ router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, requireSc
   const eventId = req.params.eventId;
   const assigneeRaw = req.body?.assignee_user_id;
   const assigneeId = assigneeRaw ? String(assigneeRaw) : null;
+  let callerRatePerMinute = getRoleBaseRate('caller');
 
   const client = await getClient();
   try {
@@ -270,10 +284,10 @@ router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, requireSc
 
     if (assigneeId) {
       const { rows } = await client.query(
-        `SELECT 1
+        `SELECT t.rate
          FROM talents t
          WHERE COALESCE(t.user_id, t.id) = $1
-           AND t.talent_role = 'caller'
+            AND t.talent_role = 'caller'
          LIMIT 1`,
         [assigneeId]
       );
@@ -281,6 +295,7 @@ router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, requireSc
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'assignee_not_caller' });
       }
+      callerRatePerMinute = normalizeRateForRole('caller', rows[0].rate);
     }
 
     const { rows: eventRows } = await client.query(
@@ -312,7 +327,7 @@ router.post('/events/:eventId/assign', authRequired, fetchCurrentUser, requireSc
         return res.status(400).json({ error: 'invalid_event_duration' });
       }
       const durationMinutes = Math.max(0, (endAt.getTime() - startAt.getTime()) / 60000);
-      const cost = Math.round(durationMinutes * 100) / 100;
+      const cost = Math.round(durationMinutes * callerRatePerMinute * 100) / 100;
       if (cost > 0) {
         const { rows: chargeRows } = await client.query(
           `UPDATE users

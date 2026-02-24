@@ -4,7 +4,19 @@ import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyProfileCreated } from '../services/notifications.js';
 
 const router = express.Router();
-const APPLICATION_COST = 0.08;
+type TalentRole = 'bidder' | 'caller';
+
+const BIDDER_BASE_RATE = 0.07;
+const CALLER_BASE_RATE = 0.5;
+
+const getRoleBaseRate = (role: TalentRole): number =>
+  role === 'caller' ? CALLER_BASE_RATE : BIDDER_BASE_RATE;
+
+const normalizeRateForRole = (role: TalentRole, rawRate: unknown): number => {
+  const parsed = Number(rawRate);
+  if (!Number.isFinite(parsed) || parsed < 0) return getRoleBaseRate(role);
+  return Math.round(parsed * 100) / 100;
+};
 
 const DEFAULT_SUCCESS_LABELS = [
   'thank you for applying',
@@ -1157,7 +1169,8 @@ const upsertApplication = async (req, res, next) => {
     await client.query('BEGIN');
 
     const { rows: profileRows } = await client.query(
-      `SELECT user_id
+      `SELECT user_id,
+              assigned_bidder_user_id
        FROM profiles
        WHERE id = $1 AND deleted_at IS NULL
        LIMIT 1`,
@@ -1168,6 +1181,24 @@ const upsertApplication = async (req, res, next) => {
       return res.status(404).json({ error: 'profile_not_found' });
     }
     const ownerId = profileRows[0].user_id;
+    const assignedBidderId = profileRows[0].assigned_bidder_user_id
+      ? String(profileRows[0].assigned_bidder_user_id)
+      : null;
+    let applicationCost = getRoleBaseRate('bidder');
+
+    if (assignedBidderId) {
+      const { rows: bidderRateRows } = await client.query(
+        `SELECT t.rate
+         FROM talents t
+         WHERE COALESCE(t.user_id, t.id) = $1
+           AND t.talent_role = 'bidder'
+         LIMIT 1`,
+        [assignedBidderId]
+      );
+      if (bidderRateRows.length > 0) {
+        applicationCost = normalizeRateForRole('bidder', bidderRateRows[0].rate);
+      }
+    }
 
     const existing = await client.query(
       `SELECT id, bids
@@ -1188,13 +1219,13 @@ const upsertApplication = async (req, res, next) => {
       );
       updatedBids.push(bid_entry);
 
-      if (!alreadyApplied && APPLICATION_COST > 0) {
+      if (!alreadyApplied && applicationCost > 0) {
         const { rows: chargeRows } = await client.query(
           `UPDATE users
            SET balance = balance - $1
            WHERE id = $2 AND balance >= $1
            RETURNING balance`,
-          [APPLICATION_COST, ownerId]
+          [applicationCost, ownerId]
         );
         if (!chargeRows.length) {
           await client.query('ROLLBACK');
@@ -1207,7 +1238,7 @@ const upsertApplication = async (req, res, next) => {
             error: 'insufficient_balance',
             message: 'Insufficient balance to apply.',
             balance,
-            required: APPLICATION_COST
+            required: applicationCost
           });
         }
       }
@@ -1223,13 +1254,13 @@ const upsertApplication = async (req, res, next) => {
       return res.json(rows[0]);
     }
 
-    if (APPLICATION_COST > 0) {
+    if (applicationCost > 0) {
       const { rows: chargeRows } = await client.query(
         `UPDATE users
          SET balance = balance - $1
          WHERE id = $2 AND balance >= $1
          RETURNING balance`,
-        [APPLICATION_COST, ownerId]
+        [applicationCost, ownerId]
       );
       if (!chargeRows.length) {
         await client.query('ROLLBACK');
@@ -1242,7 +1273,7 @@ const upsertApplication = async (req, res, next) => {
           error: 'insufficient_balance',
           message: 'Insufficient balance to apply.',
           balance,
-          required: APPLICATION_COST
+          required: applicationCost
         });
       }
     }
