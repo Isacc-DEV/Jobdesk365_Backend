@@ -5,6 +5,10 @@ import { query } from '../db.js';
 import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyAssignBidderToProfile, notifyProfileCreated } from '../services/notifications.js';
+import {
+  normalizeBaseResumeExperienceDates,
+  type ResumeDateIssue
+} from '../utils/resumeDate.js';
 
 type ProfilesAccessMode = 'user' | 'manager' | 'admin';
 
@@ -34,6 +38,16 @@ function decodeCursor(token: unknown): CursorRow | null {
   }
   return null;
 }
+
+const mapResumeDateIssues = (issues: ResumeDateIssue[]) =>
+  issues.map((issue) => ({
+    key: issue.key,
+    index: issue.index,
+    field: issue.field,
+    path: `${issue.key}[${issue.index}].${issue.field}`,
+    value: issue.value,
+    message: issue.message
+  }));
 
 function isOutlookConfigured(): boolean {
   return Boolean(config.outlook.clientId && config.outlook.clientSecret && config.outlook.redirectUri);
@@ -156,12 +170,32 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
     return res.status(400).json({ error: 'missing_required_fields' });
   }
 
+  let normalizedBaseResume = base_resume;
+  if (base_resume !== undefined) {
+    const normalized = normalizeBaseResumeExperienceDates(base_resume);
+    if (normalized.issues.length > 0) {
+      return res.status(400).json({
+        error: 'invalid_resume_date',
+        message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+        issues: mapResumeDateIssues(normalized.issues)
+      });
+    }
+    normalizedBaseResume = normalized.resume;
+  }
+
   try {
     const { rows } = await query(
       `INSERT INTO profiles (user_id, name, description, base_info, base_resume, resume_template_id)
        VALUES ($1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb), $6)
        RETURNING id`,
-      [req.currentUser.id, name, description ?? null, base_info ?? null, base_resume ?? null, resume_template_id]
+      [
+        req.currentUser.id,
+        name,
+        description ?? null,
+        base_info ?? null,
+        normalizedBaseResume ?? null,
+        resume_template_id
+      ]
     );
     const createdId = rows[0]?.id;
     const created = await fetchProfileOr404(createdId, true, req.currentUser.id);
@@ -239,6 +273,7 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   const updates = [];
   const params = [];
   const updateParamStart = allowAll ? 2 : 3;
+  let normalizedBaseResume = base_resume;
 
   if (name !== undefined) {
     updates.push(`name = $${updates.length + updateParamStart}`);
@@ -253,8 +288,17 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
     params.push(base_info);
   }
   if (base_resume !== undefined) {
+    const normalized = normalizeBaseResumeExperienceDates(base_resume);
+    if (normalized.issues.length > 0) {
+      return res.status(400).json({
+        error: 'invalid_resume_date',
+        message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+        issues: mapResumeDateIssues(normalized.issues)
+      });
+    }
+    normalizedBaseResume = normalized.resume;
     updates.push(`base_resume = COALESCE($${updates.length + updateParamStart}::jsonb, '{}'::jsonb)`);
-    params.push(base_resume);
+    params.push(normalizedBaseResume);
   }
   if (resume_template_id !== undefined) {
     updates.push(`resume_template_id = $${updates.length + updateParamStart}`);

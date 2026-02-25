@@ -2,6 +2,11 @@ import express from 'express';
 import { getClient, query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyProfileCreated } from '../services/notifications.js';
+import {
+  normalizeBaseResumeExperienceDates,
+  normalizeResumeDateInput,
+  type ResumeDateIssue
+} from '../utils/resumeDate.js';
 
 const router = express.Router();
 type TalentRole = 'bidder' | 'caller';
@@ -392,6 +397,16 @@ const ensureUrlProtocol = (value: string): string => {
   return `https://${trimmed}`;
 };
 
+const mapResumeDateIssues = (issues: ResumeDateIssue[]) =>
+  issues.map((issue) => ({
+    key: issue.key,
+    index: issue.index,
+    field: issue.field,
+    path: `${issue.key}[${issue.index}].${issue.field}`,
+    value: issue.value,
+    message: issue.message
+  }));
+
 const normalizeJobUrl = (value: string): string => {
   const raw = value.trim();
   if (!raw) return raw;
@@ -598,6 +613,10 @@ const normalizeResumeWorkExperience = (value: any) => {
   const isPresent = Boolean(
     value.isPresent ?? value.isCurrent ?? String(value.end_date || value.endDate || '').toLowerCase() === 'present'
   );
+  const startRaw = asString(pickValue(value, ['startDate', 'start_date'])) || '';
+  const endRaw = asString(pickValue(value, ['endDate', 'end_date'])) || '';
+  const normalizedStart = normalizeResumeDateInput(startRaw, { allowPresent: false });
+  const normalizedEnd = normalizeResumeDateInput(isPresent ? 'Present' : endRaw, { allowPresent: true });
 
   return {
     companyTitle: asString(pickValue(value, ['companyTitle', 'company_name', 'companyName'])) || '',
@@ -605,10 +624,8 @@ const normalizeResumeWorkExperience = (value: any) => {
     employmentType:
       asString(pickValue(value, ['employmentType', 'employment_type'])) || '',
     location: asString(pickValue(value, ['location', 'location_text', 'locationText'])) || '',
-    startDate: asString(pickValue(value, ['startDate', 'start_date'])) || '',
-    endDate: isPresent
-      ? 'Present'
-      : asString(pickValue(value, ['endDate', 'end_date'])) || '',
+    startDate: normalizedStart.isValid ? normalizedStart.value : startRaw,
+    endDate: normalizedEnd.isValid ? normalizedEnd.value : (isPresent ? 'Present' : endRaw),
     bullets
   };
 };
@@ -733,6 +750,10 @@ const mapExtensionProfile = (row: any) => {
     ...baseAdditionalInfo
   };
   const normalizedResume = normalizeResumeFromBaseResume(row.base_resume);
+  const extWorkExperienceSource = ext.work_experience ?? ext.workExperience ?? [];
+  const normalizedExtWorkExperience = Array.isArray(extWorkExperienceSource)
+    ? extWorkExperienceSource.map(normalizeResumeWorkExperience).filter(Boolean)
+    : [];
   return {
     id: row.id,
     user_id: row.user_id,
@@ -741,7 +762,7 @@ const mapExtensionProfile = (row: any) => {
     personal_info: mergedPersonalInfo,
     additional_info: mergedAdditionalInfo,
     education: ext.education ?? [],
-    work_experience: ext.work_experience ?? ext.workExperience ?? [],
+    work_experience: normalizedExtWorkExperience,
     custom_fields: ext.custom_fields ?? ext.customFields ?? [],
     settings: ext.settings ?? DEFAULT_SETTINGS,
     resume: normalizedResume ?? row.base_resume ?? null,
@@ -839,6 +860,15 @@ router.post('/profiles', async (req, res, next) => {
   const customFields = payload.custom_fields ?? payload.customFields ?? defaults.custom_fields;
   const settings = payload.settings ?? defaults.settings;
   const resume = payload.resume ?? null;
+  const normalizedResumeResult = normalizeBaseResumeExperienceDates(resume ?? {});
+  if (normalizedResumeResult.issues.length > 0) {
+    return res.status(400).json({
+      error: 'invalid_resume_date',
+      message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+      issues: mapResumeDateIssues(normalizedResumeResult.issues)
+    });
+  }
+  const normalizedResume = normalizedResumeResult.resume;
 
   try {
     const templateId = await ensureResumeTemplateId(req.currentUser.id);
@@ -852,7 +882,7 @@ router.post('/profiles', async (req, res, next) => {
       settings
     };
     const baseInfoJson = toJson({ extension_profile: extensionProfile });
-    const resumeJson = toJson(resume ?? {});
+    const resumeJson = toJson(normalizedResume ?? {});
     const { rows } = await query(
       `INSERT INTO profiles
        (user_id, name, description, base_info, base_resume, resume_template_id)
@@ -932,7 +962,18 @@ router.patch('/profiles/:profileId', async (req, res, next) => {
     ].some((value) => value !== undefined);
 
     const nextBaseInfo = extFieldsProvided ? mergeExtensionProfile(row.base_info, payload) : row.base_info;
-    const nextResume = payload.resume !== undefined ? payload.resume : row.base_resume;
+    let nextResume = payload.resume !== undefined ? payload.resume : row.base_resume;
+    if (payload.resume !== undefined) {
+      const normalizedResumeResult = normalizeBaseResumeExperienceDates(payload.resume ?? {});
+      if (normalizedResumeResult.issues.length > 0) {
+        return res.status(400).json({
+          error: 'invalid_resume_date',
+          message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+          issues: mapResumeDateIssues(normalizedResumeResult.issues)
+        });
+      }
+      nextResume = normalizedResumeResult.resume;
+    }
 
     const updates: string[] = [];
     const params: unknown[] = [req.params.profileId, req.currentUser.id];
