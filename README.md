@@ -59,7 +59,7 @@ The server listens on `http://localhost:4000` by default.
 - `POST /profiles/{profile_id}/assign-bidder` â€” body: `{ bidder_user_id }`; bidder must hold the `bidder` role in `user_roles`. Returns updated `Profile`.
 - `POST /profiles/{profile_id}/unassign-bidder` â€” clears `assigned_bidder_user_id/assigned_at`. Returns updated `Profile`.
 - `POST /profiles/{profile_id}/email/outlook/authorize` â€” returns Outlook OAuth URL and signed `state`; this step does not write `email_accounts`.
-- `POST /admin/profiles/{profile_id}/email/outlook/authorize` â€” same behavior as user route but still owner-scoped (admin/manager cannot connect another user's mailbox).
+- `POST /admin/profiles/{profile_id}/email/outlook/authorize` â€” admin can authorize Outlook for any active profile; manager/user routes remain owner-scoped.
 
 ## Outlook OAuth callback behavior
 - Token and profile writes happen only in `GET /email/outlook/callback`.

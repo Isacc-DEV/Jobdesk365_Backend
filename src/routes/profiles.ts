@@ -446,6 +446,7 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   const connectTraceId = randomUUID();
   const requestOrigin = toOrigin(req.get('origin'));
   const routeScope = mode;
+  const isAdminRoute = mode === 'admin';
 
   if (!isOutlookConfigured()) {
     logOutlookAuthorize('outlook_not_configured', {
@@ -459,12 +460,17 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   }
 
   try {
-    const { rows } = await query(
-      `SELECT id
-       FROM profiles
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-       LIMIT 1`,
-      [req.params.profileId, req.currentUser.id]
+    const { rows } = await query<{ id: string; user_id: string }>(
+      isAdminRoute
+        ? `SELECT id, user_id
+           FROM profiles
+           WHERE id = $1 AND deleted_at IS NULL
+           LIMIT 1`
+        : `SELECT id, user_id
+           FROM profiles
+           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+           LIMIT 1`,
+      isAdminRoute ? [req.params.profileId] : [req.params.profileId, req.currentUser.id]
     );
     if (rows.length === 0) {
       logOutlookAuthorize('owner_scope_guard_not_found', {
@@ -476,12 +482,14 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
       });
       return res.status(404).json({ error: 'not_found' });
     }
+    const profileOwnerUserId = rows[0]?.user_id || req.currentUser.id;
 
     const state = jwt.sign(
       {
         purpose: 'outlook_connect',
         profile_id: req.params.profileId,
-        user_id: req.currentUser.id,
+        user_id: profileOwnerUserId,
+        actor_user_id: req.currentUser.id,
         frontend_origin: requestOrigin,
         connect_trace_id: connectTraceId
       },

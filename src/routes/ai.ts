@@ -6,6 +6,8 @@ import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 const router = express.Router();
 const RESUME_GENERATE_COST = 0.04;
 const RESUME_REGENERATE_COST = 0.02;
+const hasRole = (roles: string[] | null | undefined, role: string) =>
+  Array.isArray(roles) && roles.includes(role);
 
 type AiErrorResponse = {
   error?: {
@@ -281,6 +283,8 @@ router.post('/resume-tailor', async (req, res, next) => {
   let charged = false;
   let chargeAmount = regenerate ? RESUME_REGENERATE_COST : RESUME_GENERATE_COST;
   if (!Number.isFinite(chargeAmount) || chargeAmount < 0) chargeAmount = 0;
+  const isAdmin = hasRole(req.currentUser?.roles, 'admin');
+  let chargeUserId = req.currentUser.id;
   const refundCharge = async () => {
     if (!charged || chargeAmount <= 0) return;
     try {
@@ -288,7 +292,7 @@ router.post('/resume-tailor', async (req, res, next) => {
         `UPDATE users
          SET balance = balance + $1
          WHERE id = $2`,
-        [chargeAmount, req.currentUser.id]
+        [chargeAmount, chargeUserId]
       );
     } catch {
       // best-effort refund
@@ -296,16 +300,22 @@ router.post('/resume-tailor', async (req, res, next) => {
   };
 
   try {
-    const { rows } = await query(
-      `SELECT base_resume
-       FROM profiles
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-       LIMIT 1`,
-      [profile_id, req.currentUser.id]
+    const { rows } = await query<{ base_resume: unknown; user_id: string }>(
+      isAdmin
+        ? `SELECT base_resume, user_id
+           FROM profiles
+           WHERE id = $1 AND deleted_at IS NULL
+           LIMIT 1`
+        : `SELECT base_resume, user_id
+           FROM profiles
+           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+           LIMIT 1`,
+      isAdmin ? [profile_id] : [profile_id, req.currentUser.id]
     );
     if (rows.length === 0) {
       return res.status(404).json({ error: 'profile_not_found' });
     }
+    chargeUserId = rows[0]?.user_id || req.currentUser.id;
 
     if (chargeAmount > 0) {
       const { rows: chargeRows } = await query(
@@ -313,12 +323,12 @@ router.post('/resume-tailor', async (req, res, next) => {
          SET balance = balance - $1
          WHERE id = $2 AND balance >= $1
          RETURNING balance`,
-        [chargeAmount, req.currentUser.id]
+        [chargeAmount, chargeUserId]
       );
       if (!chargeRows.length) {
         const { rows: balanceRows } = await query(
           `SELECT balance FROM users WHERE id = $1`,
-          [req.currentUser.id]
+          [chargeUserId]
         );
         const balance = balanceRows[0]?.balance ?? 0;
         return res.status(402).json({
