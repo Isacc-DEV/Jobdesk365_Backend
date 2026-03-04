@@ -15,12 +15,17 @@ type CurrentUser = {
   plan: string;
   balance: number;
   verified: boolean;
+  blocked_at?: string | Date | null;
   last_login_at: string | Date | null;
   last_login_place: string | null;
   roles: string[];
+  badges: string[];
   created_at: string | Date;
   updated_at: string | Date;
 };
+
+export const INTERNAL_WORKER_BLOCK_MESSAGE =
+  'plz contact to support team and get verified as internal worker';
 
 export function authRequired(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
@@ -51,6 +56,7 @@ export async function fetchCurrentUser(req: Request, res: Response, next: NextFu
               plan,
               balance,
               verified,
+              blocked_at,
               last_login_at,
               last_login_place,
               ARRAY(
@@ -65,7 +71,35 @@ export async function fetchCurrentUser(req: Request, res: Response, next: NextFu
       [req.user.id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'user_not_found' });
-    req.currentUser = rows[0];
+    const current = rows[0];
+    let badges: string[] = [];
+    try {
+      const badgeRows = await query<{ key: string }>(
+        `SELECT DISTINCT COALESCE(ub.badge_key, ub.talent_role) AS key
+         FROM user_badges ub
+         WHERE COALESCE(ub.user_id, ub.id) = $1
+           AND COALESCE(ub.badge_key, ub.talent_role) IS NOT NULL`,
+        [req.user.id]
+      );
+      badges = badgeRows.rows.map((row) => String(row.key || '')).filter(Boolean);
+    } catch (err) {
+      // user_badges may not exist before schema migration; keep auth compatible.
+      badges = [];
+    }
+    req.currentUser = { ...current, badges };
+    if (current.blocked_at) {
+      return res.status(403).json({
+        error: 'account_blocked',
+        message: 'Your account is blocked. Please contact support team.'
+      });
+    }
+    const roles = Array.isArray(current.roles) ? current.roles.map((role) => String(role || '')) : [];
+    if (!current.verified && roles.includes('worker')) {
+      return res.status(403).json({
+        error: 'worker_not_verified',
+        message: INTERNAL_WORKER_BLOCK_MESSAGE
+      });
+    }
     return next();
   } catch (err) {
     next(err);

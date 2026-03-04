@@ -1,19 +1,18 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { randomUUID } from 'node:crypto';
-import { query } from '../db.js';
+import type { PoolClient } from 'pg';
+import { getClient, query } from '../db.js';
 import { config } from '../config.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyAssignBidderToProfile, notifyProfileCreated } from '../services/notifications.js';
+import { canAccessManagerScope, isAdmin } from '../lib/accessControl.js';
 import {
   normalizeBaseResumeExperienceDates,
   type ResumeDateIssue
 } from '../utils/resumeDate.js';
 
 type ProfilesAccessMode = 'user' | 'manager' | 'admin';
-
-const hasRole = (roles: string[] | null | undefined, role: string) =>
-  Array.isArray(roles) && roles.includes(role);
 
 function parseLimit(value: unknown): number {
   const num = Number(value);
@@ -82,13 +81,14 @@ function logOutlookAuthorize(event: string, payload: Record<string, unknown>): v
 const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   const router = express.Router();
   const allowAll = mode !== 'user';
+  const isElevatedRoute = mode === 'manager' || mode === 'admin';
 
   router.use(authRequired, fetchCurrentUser);
   router.use((req, res, next) => {
-    if (mode === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+    if (mode === 'admin' && !isAdmin(req.currentUser?.roles)) {
       return res.status(403).json({ error: 'admin_required' });
     }
-    if (mode === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+    if (mode === 'manager' && !canAccessManagerScope(req.currentUser)) {
       return res.status(403).json({ error: 'manager_required' });
     }
     return next();
@@ -165,7 +165,7 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
 
   // 2) Create profile
   router.post('/', async (req, res, next) => {
-  const { name, description, base_info, base_resume, resume_template_id } = req.body || {};
+  const { name, description, base_info, base_resume, resume_template_id, user_id } = req.body || {};
   if (!name || !resume_template_id) {
     return res.status(400).json({ error: 'missing_required_fields' });
   }
@@ -176,20 +176,53 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
     if (normalized.issues.length > 0) {
       return res.status(400).json({
         error: 'invalid_resume_date',
-        message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+        message: 'Invalid work experience date format. Use MM/YYYY, and use Present only for endDate.',
         issues: mapResumeDateIssues(normalized.issues)
       });
     }
     normalizedBaseResume = normalized.resume;
   }
 
+  const requestedOwnerUserId = user_id ? String(user_id).trim() : '';
+  let targetOwnerUserId = req.currentUser.id;
+
+  if (isElevatedRoute && requestedOwnerUserId) {
+    try {
+      const { rows } = await query<{ id: string; is_admin: boolean; is_worker: boolean }>(
+        `SELECT u.id,
+                COALESCE(BOOL_OR(r.key = 'admin'), false) AS is_admin,
+                COALESCE(BOOL_OR(r.key = 'worker'), false) AS is_worker
+         FROM users u
+         LEFT JOIN user_roles ur ON ur.user_id = u.id
+         LEFT JOIN roles r ON r.id = ur.role_id
+         WHERE u.id = $1
+           AND u.deleted_at IS NULL
+         GROUP BY u.id
+         LIMIT 1`,
+        [requestedOwnerUserId]
+      );
+      if (!rows.length) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      const target = rows[0];
+      const isSelf = target.id === req.currentUser.id;
+      const isElevatedTarget = Boolean(target.is_admin || target.is_worker);
+      if (!isSelf && isElevatedTarget) {
+        return res.status(404).json({ error: 'not_found' });
+      }
+      targetOwnerUserId = target.id;
+    } catch (err) {
+      return next(err);
+    }
+  }
+
   try {
     const { rows } = await query(
       `INSERT INTO profiles (user_id, name, description, base_info, base_resume, resume_template_id)
        VALUES ($1, $2, $3, COALESCE($4::jsonb, '{}'::jsonb), COALESCE($5::jsonb, '{}'::jsonb), $6)
-       RETURNING id`,
+      RETURNING id`,
       [
-        req.currentUser.id,
+        targetOwnerUserId,
         name,
         description ?? null,
         base_info ?? null,
@@ -292,7 +325,7 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
     if (normalized.issues.length > 0) {
       return res.status(400).json({
         error: 'invalid_resume_date',
-        message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+        message: 'Invalid work experience date format. Use MM/YYYY, and use Present only for endDate.',
         issues: mapResumeDateIssues(normalized.issues)
       });
     }
@@ -441,7 +474,74 @@ const createProfilesRouter = (mode: ProfilesAccessMode = 'user') => {
   }
   });
 
-  // 8) Start Outlook email connection
+  // 8) Disconnect Outlook email connection
+  router.post('/:profileId/email/outlook/disconnect', async (req, res, next) => {
+  const isAdminRoute = mode === 'admin';
+
+  let client: PoolClient | null = null;
+  try {
+    client = await getClient();
+    await client.query('BEGIN');
+
+    const { rows } = await client.query<{ id: string; email_account_id: string | null }>(
+      isAdminRoute
+        ? `SELECT id, email_account_id
+           FROM profiles
+           WHERE id = $1 AND deleted_at IS NULL
+           LIMIT 1`
+        : `SELECT id, email_account_id
+           FROM profiles
+           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+           LIMIT 1`,
+      isAdminRoute ? [req.params.profileId] : [req.params.profileId, req.currentUser.id]
+    );
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const profileId = rows[0]?.id;
+    const emailAccountId = rows[0]?.email_account_id;
+
+    if (emailAccountId) {
+      await client.query(
+        `UPDATE profiles
+         SET email_account_id = NULL
+         WHERE id = $1`,
+        [profileId]
+      );
+      await client.query(
+        `DELETE FROM email_accounts
+         WHERE id = $1`,
+        [emailAccountId]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const updated = await fetchProfileOr404(
+      req.params.profileId,
+      false,
+      req.currentUser.id
+    );
+    if (!updated) return res.status(404).json({ error: 'not_found' });
+    return res.json(updated);
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        // ignore rollback errors
+      }
+    }
+    next(err);
+  } finally {
+    if (client) client.release();
+  }
+  });
+
+  // 9) Start Outlook email connection
   router.post('/:profileId/email/outlook/authorize', async (req, res, next) => {
   const connectTraceId = randomUUID();
   const requestOrigin = toOrigin(req.get('origin'));

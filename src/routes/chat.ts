@@ -8,6 +8,7 @@ import { config } from '../config.js';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { broadcastToEmployees, broadcastToThread, broadcastToUsers } from '../realtime/chatRealtime.js';
+import { canAccessManagerScope, isAdmin, isWorker } from '../lib/accessControl.js';
 
 const router = express.Router();
 
@@ -30,10 +31,10 @@ const attachmentUpload = multer({
 }).single('file');
 
 const isEmployee = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager' || role === 'worker');
+  isAdmin(roles) || isWorker(roles);
 
-const isAdminOrManager = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+const isAdminOrManager = (user?: { roles?: string[] | null; badges?: string[] | null } | null) =>
+  isAdmin(user?.roles) || canAccessManagerScope(user);
 
 const safeText = (value: unknown) => String(value || '').trim();
 
@@ -906,7 +907,7 @@ router.post('/threads/:threadId/messages', authRequired, fetchCurrentUser, async
 });
 
 router.post('/threads/:threadId/assign', authRequired, fetchCurrentUser, async (req, res, next) => {
-  if (!isAdminOrManager(req.currentUser?.roles)) {
+  if (!isAdminOrManager(req.currentUser)) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const threadId = req.params.threadId;
@@ -929,7 +930,7 @@ router.post('/threads/:threadId/assign', authRequired, fetchCurrentUser, async (
 });
 
 router.patch('/threads/:threadId', authRequired, fetchCurrentUser, async (req, res, next) => {
-  if (!isAdminOrManager(req.currentUser?.roles)) {
+  if (!isAdminOrManager(req.currentUser)) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const threadId = req.params.threadId;
@@ -1056,3 +1057,4 @@ router.post('/messages/:messageId/attachments', authRequired, fetchCurrentUser, 
 });
 
 export default router;
+

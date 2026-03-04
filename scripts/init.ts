@@ -141,6 +141,7 @@ async function applySchema() {
         plan plan_type NOT NULL DEFAULT 'free'::plan_type,
         balance numeric(12, 2) NOT NULL DEFAULT 1,
         verified boolean NOT NULL DEFAULT false,
+        blocked_at timestamptz,
         last_login_at timestamptz,
         last_login_place text,
         created_at timestamptz NOT NULL DEFAULT now(),
@@ -165,6 +166,11 @@ async function applySchema() {
       `);
 
       await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS blocked_at timestamptz
+      `);
+
+      await client.query(`
         UPDATE users
         SET balance = 1
         WHERE balance IS NULL
@@ -178,16 +184,25 @@ async function applySchema() {
       EXECUTE FUNCTION set_row_updated_at();
     `);
 
+    await client.query(`DROP INDEX IF EXISTS idx_users_email_ci_uniq`);
+    await client.query(`DROP INDEX IF EXISTS idx_users_username_ci_uniq`);
+
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_ci_uniq
+      CREATE INDEX IF NOT EXISTS idx_users_email_ci
       ON users (lower(email))
       WHERE deleted_at IS NULL
     `);
 
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_ci_uniq
+      CREATE INDEX IF NOT EXISTS idx_users_username_ci
       ON users (lower(username))
       WHERE deleted_at IS NULL
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_blocked_at
+      ON users (blocked_at)
+      WHERE blocked_at IS NOT NULL
     `);
 
     await client.query(`
@@ -416,13 +431,55 @@ async function applySchema() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_calendar_events_start_at ON calendar_events (start_at)`);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS manual_calendar_events (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title text NOT NULL,
+        start_at timestamptz NOT NULL,
+        end_at timestamptz NOT NULL,
+        profile_id uuid REFERENCES profiles(id) ON DELETE SET NULL,
+        requested_caller_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+        assigned_caller_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+        caller_request_id uuid,
+        call_status text NOT NULL DEFAULT 'unassigned',
+        note text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT manual_calendar_events_call_status_allowed
+          CHECK (call_status IN ('unassigned', 'pending', 'assigned', 'rejected')),
+        CONSTRAINT manual_calendar_events_time_range_valid CHECK (end_at > start_at)
+      )
+    `);
+
+    await client.query(`
+      DROP TRIGGER IF EXISTS trg_manual_calendar_events_updated_at ON manual_calendar_events;
+      CREATE TRIGGER trg_manual_calendar_events_updated_at
+      BEFORE UPDATE ON manual_calendar_events
+      FOR EACH ROW
+      EXECUTE FUNCTION set_row_updated_at();
+    `);
+
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_calendar_events_owner_user_id ON manual_calendar_events (owner_user_id)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_calendar_events_assigned_caller_user_id ON manual_calendar_events (assigned_caller_user_id)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_calendar_events_start_at ON manual_calendar_events (start_at)`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_calendar_events_caller_request_id ON manual_calendar_events (caller_request_id)`
+    );
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS roles (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         key text NOT NULL,
         name text,
         created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now(),
-        CONSTRAINT roles_key_allowed CHECK (key IN ('client', 'admin', 'manager', 'worker')),
+        CONSTRAINT roles_key_allowed CHECK (key IN ('admin', 'worker', 'user')),
         CONSTRAINT roles_key_unique UNIQUE (key)
       )
     `);
@@ -550,10 +607,9 @@ async function applySchema() {
       `
       INSERT INTO roles (key, name)
       VALUES 
-        ('client', 'Client'),
         ('admin', 'Admin'),
-        ('manager', 'Manager'),
-        ('worker', 'Worker')
+        ('worker', 'Worker'),
+        ('user', 'User')
       ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name, updated_at = now()
       `
     );
@@ -587,6 +643,21 @@ async function applySchema() {
           updated_at timestamptz NOT NULL DEFAULT now(),
           closed_at timestamptz
         )
+      `);
+
+      await client.query(`
+        DO $$
+        BEGIN
+          UPDATE chat_threads
+          SET user_type = 'user'
+          WHERE user_type = 'client';
+
+          ALTER TABLE chat_threads DROP CONSTRAINT IF EXISTS chat_threads_user_type_check;
+          ALTER TABLE chat_threads
+          ADD CONSTRAINT chat_threads_user_type_check
+          CHECK (user_type IN ('user', 'guest'));
+        END
+        $$;
       `);
 
       await client.query(`
@@ -974,6 +1045,14 @@ async function applySchema() {
         END IF;
 
         IF EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'talents'
+        ) AND NOT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'user_badges'
+        ) THEN
+          ALTER TABLE talents RENAME TO user_badges;
+        END IF;
+
+        IF EXISTS (
           SELECT 1 FROM information_schema.tables WHERE table_name = 'hire_requests'
         ) AND NOT EXISTS (
           SELECT 1 FROM information_schema.tables WHERE table_name = 'requests'
@@ -985,9 +1064,10 @@ async function applySchema() {
     `);
 
     await client.query(`
-      CREATE TABLE IF NOT EXISTS talents (
+      CREATE TABLE IF NOT EXISTS user_badges (
         id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+        badge_key text,
         talent_role text,
         name text,
         bio text,
@@ -1003,18 +1083,11 @@ async function applySchema() {
       )
     `);
 
+    await client.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS img_url text`);
+    await client.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS badge_key text`);
+    await client.query(`ALTER TABLE user_badges ADD COLUMN IF NOT EXISTS talent_role text`);
     await client.query(`
-      ALTER TABLE talents
-      ADD COLUMN IF NOT EXISTS img_url text
-    `);
-
-    await client.query(`
-      ALTER TABLE talents
-      ADD COLUMN IF NOT EXISTS talent_role text
-    `);
-
-    await client.query(`
-      ALTER TABLE talents
+      ALTER TABLE user_badges
       ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES users(id) ON DELETE CASCADE
     `);
 
@@ -1024,209 +1097,244 @@ async function applySchema() {
         IF EXISTS (
           SELECT 1
           FROM information_schema.table_constraints
-          WHERE table_name = 'talents'
+          WHERE table_name = 'user_badges'
             AND constraint_type = 'PRIMARY KEY'
         ) THEN
-          ALTER TABLE talents DROP CONSTRAINT IF EXISTS talents_pkey;
+          ALTER TABLE user_badges DROP CONSTRAINT IF EXISTS user_badges_pkey;
         END IF;
         IF NOT EXISTS (
           SELECT 1
           FROM information_schema.table_constraints
-          WHERE constraint_name = 'talents_user_role_unique'
-            AND table_name = 'talents'
+          WHERE constraint_name = 'user_badges_user_badge_unique'
+            AND table_name = 'user_badges'
         ) THEN
-          ALTER TABLE talents
-          ADD CONSTRAINT talents_user_role_unique UNIQUE (id, talent_role);
+          ALTER TABLE user_badges
+          ADD CONSTRAINT user_badges_user_badge_unique UNIQUE (id, badge_key);
         END IF;
       END
       $$;
     `);
 
     await client.query(`
-      UPDATE talents
+      UPDATE user_badges
       SET user_id = id
       WHERE user_id IS NULL
+    `);
+    await client.query(`
+      UPDATE user_badges
+      SET badge_key = talent_role
+      WHERE badge_key IS NULL AND talent_role IS NOT NULL
+    `);
+    await client.query(`
+      UPDATE user_badges
+      SET talent_role = badge_key
+      WHERE talent_role IS NULL AND badge_key IS NOT NULL
     `);
 
     await client.query(`
       DO $$
       BEGIN
-        IF NOT EXISTS (
+        IF EXISTS (
           SELECT 1
           FROM information_schema.table_constraints
           WHERE constraint_name = 'talents_role_allowed'
-            AND table_name = 'talents'
+            AND table_name = 'user_badges'
         ) THEN
-          ALTER TABLE talents
-          ADD CONSTRAINT talents_role_allowed
-          CHECK (talent_role IN ('bidder', 'caller'));
+          ALTER TABLE user_badges DROP CONSTRAINT talents_role_allowed;
         END IF;
+        IF EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints
+          WHERE constraint_name = 'user_badges_role_allowed'
+            AND table_name = 'user_badges'
+        ) THEN
+          ALTER TABLE user_badges DROP CONSTRAINT user_badges_role_allowed;
+        END IF;
+        ALTER TABLE user_badges
+        ADD CONSTRAINT user_badges_role_allowed
+        CHECK (badge_key IN ('manager', 'bidder', 'caller'));
       END
       $$;
     `);
 
     await client.query(`
-      UPDATE talents t
-      SET talent_role = r.key
-      FROM user_roles ur
-      JOIN roles r ON r.id = ur.role_id
-      WHERE t.talent_role IS NULL
-        AND ur.user_id = COALESCE(t.user_id, t.id)
-        AND r.key IN ('bidder', 'caller')
-    `);
-
-    await client.query(`
-      DROP TRIGGER IF EXISTS trg_hire_people_updated_at ON talents;
-      DROP TRIGGER IF EXISTS trg_talents_updated_at ON talents;
-      CREATE TRIGGER trg_talents_updated_at
-      BEFORE UPDATE ON talents
+      DROP TRIGGER IF EXISTS trg_hire_people_updated_at ON user_badges;
+      DROP TRIGGER IF EXISTS trg_talents_updated_at ON user_badges;
+      DROP TRIGGER IF EXISTS trg_user_badges_updated_at ON user_badges;
+      CREATE TRIGGER trg_user_badges_updated_at
+      BEFORE UPDATE ON user_badges
       FOR EACH ROW
       EXECUTE FUNCTION set_row_updated_at();
     `);
 
     await client.query(`DROP INDEX IF EXISTS idx_hire_people_email`);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_talents_email ON talents (email)`);
+    await client.query(`DROP INDEX IF EXISTS idx_talents_email`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_user_badges_email ON user_badges (email)`);
 
     await client.query(`
-      INSERT INTO talents (id, user_id, talent_role, name, bio, skill, email, phone_number, whatsapp, telegram, rate)
+      WITH role_ids AS (
+        SELECT
+          (SELECT id FROM roles WHERE key = 'user' LIMIT 1) AS user_role_id
+      ),
+      legacy_memberships AS (
+        SELECT ur.user_id, r.key
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE r.key IN ('client', 'manager', 'bidder', 'caller')
+      )
+      INSERT INTO user_roles (user_id, role_id)
+      SELECT DISTINCT lm.user_id, ri.user_role_id
+      FROM legacy_memberships lm
+      CROSS JOIN role_ids ri
+      WHERE lm.key = 'client'
+        AND ri.user_role_id IS NOT NULL
+      ON CONFLICT DO NOTHING
+    `);
+
+    await client.query(`
+      WITH role_ids AS (
+        SELECT
+          (SELECT id FROM roles WHERE key = 'worker' LIMIT 1) AS worker_role_id
+      ),
+      legacy_memberships AS (
+        SELECT ur.user_id, r.key
+        FROM user_roles ur
+        JOIN roles r ON r.id = ur.role_id
+        WHERE r.key IN ('manager', 'bidder', 'caller')
+      )
+      INSERT INTO user_roles (user_id, role_id)
+      SELECT DISTINCT lm.user_id, ri.worker_role_id
+      FROM legacy_memberships lm
+      CROSS JOIN role_ids ri
+      WHERE ri.worker_role_id IS NOT NULL
+      ON CONFLICT DO NOTHING
+    `);
+
+    await client.query(`
+      INSERT INTO user_badges (id, user_id, badge_key, talent_role, name, bio, email)
       SELECT u.id,
              u.id,
              r.key,
+             r.key,
              COALESCE(u.display_name, u.username),
              u.bio,
-             CASE WHEN r.key = 'caller' THEN 'Calling' ELSE 'Applications' END,
-             u.email,
-             NULL,
-             NULL,
-             NULL,
-             CASE WHEN r.key = 'caller' THEN 35 ELSE 3 END
-      FROM users u
-      JOIN user_roles ur ON ur.user_id = u.id
+             u.email
+      FROM user_roles ur
       JOIN roles r ON r.id = ur.role_id
-      WHERE r.key IN ('bidder', 'caller')
-      ON CONFLICT (id, talent_role) DO NOTHING
+      JOIN users u ON u.id = ur.user_id
+      WHERE r.key IN ('manager', 'bidder', 'caller')
+      ON CONFLICT (id, badge_key) DO NOTHING
     `);
 
-    await client.query(
-      `
-      WITH mock_talents (email, username, display_name, bio, role_key, rate, img_url, phone_number, whatsapp, telegram, skill) AS (
-        VALUES
-          ('mock.caller1@jobdesk.local', 'caller.one', 'Callie Stone', 'Customer-focused caller with a calm tone.', 'caller', 32, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-1.jpg', '555-0101', '555-0101', 'caller.one', 'Outbound calling'),
-          ('mock.caller2@jobdesk.local', 'caller.two', 'Noah Reed', 'Fast, friendly outreach and follow-up specialist.', 'caller', 28, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-2.jpg', '555-0102', '555-0102', 'caller.two', 'Lead follow-up'),
-          ('mock.caller3@jobdesk.local', 'caller.three', 'Ava Brooks', 'Empathetic caller with experience in pipelines.', 'caller', 30, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-3.jpg', '555-0103', '555-0103', 'caller.three', 'Pipeline outreach'),
-          ('mock.bidder1@jobdesk.local', 'bidder.one', 'Ethan Park', 'High-volume application specialist.', 'bidder', 4, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-1.jpg', '555-0201', '555-0201', 'bidder.one', 'Applications'),
-          ('mock.bidder2@jobdesk.local', 'bidder.two', 'Mia Patel', 'Accurate and fast bidder with ATS expertise.', 'bidder', 5, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-2.jpg', '555-0202', '555-0202', 'bidder.two', 'ATS bids'),
-          ('mock.bidder3@jobdesk.local', 'bidder.three', 'Lucas Ortiz', 'Detail-oriented application optimizer.', 'bidder', 3, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-3.jpg', '555-0203', '555-0203', 'bidder.three', 'Application targeting')
-      ),
-      ensured_users AS (
-        INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan)
-        SELECT mt.email, mt.username, $1, mt.display_name, mt.bio, NULL, 'free'
-        FROM mock_talents mt
-        WHERE NOT EXISTS (
-          SELECT 1 FROM users u WHERE lower(u.email) = lower(mt.email)
-        )
-        RETURNING id, email
-      ),
-      all_users AS (
-        SELECT u.id, u.email
-        FROM users u
-        JOIN mock_talents mt ON lower(u.email) = lower(mt.email)
-      ),
-      role_links AS (
-        INSERT INTO user_roles (user_id, role_id)
-        SELECT au.id, r.id
-        FROM all_users au
-        JOIN mock_talents mt ON lower(mt.email) = lower(au.email)
-        JOIN roles r ON r.key = 'worker'
-        ON CONFLICT DO NOTHING
-      )
-      INSERT INTO talents (id, user_id, talent_role, name, bio, skill, email, phone_number, whatsapp, telegram, rate, img_url)
-      SELECT au.id,
-             au.id,
-             mt.role_key,
-             mt.display_name,
-             mt.bio,
-             mt.skill,
-             mt.email,
-             mt.phone_number,
-             mt.whatsapp,
-             mt.telegram,
-             mt.rate,
-             mt.img_url
-      FROM all_users au
-      JOIN mock_talents mt ON lower(mt.email) = lower(au.email)
-      ON CONFLICT (id, talent_role) DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        talent_role = EXCLUDED.talent_role,
-        name = EXCLUDED.name,
-        bio = EXCLUDED.bio,
-        skill = EXCLUDED.skill,
-        email = EXCLUDED.email,
-        phone_number = EXCLUDED.phone_number,
-        whatsapp = EXCLUDED.whatsapp,
-        telegram = EXCLUDED.telegram,
-        rate = EXCLUDED.rate,
-        img_url = EXCLUDED.img_url
-      `,
-      ['$2b$10$N9qo8uLOickgx2ZMRZo5e.Puq8No3BFEtGYwd5j9Vn0iJrO9wBLs.']
-    );
-
     await client.query(`
-      WITH worker_role AS (
-        SELECT id FROM roles WHERE key = 'worker' LIMIT 1
-      ),
-      legacy_roles AS (
-        SELECT id FROM roles WHERE key IN ('bidder', 'caller')
-      ),
-      legacy_rows AS (
-        SELECT ur.id,
-               ur.user_id,
-               ROW_NUMBER() OVER (PARTITION BY ur.user_id ORDER BY ur.id) AS rn,
-               EXISTS (
-                 SELECT 1
-                 FROM user_roles ur2
-                 WHERE ur2.user_id = ur.user_id
-                   AND ur2.role_id = (SELECT id FROM worker_role)
-               ) AS has_worker
-        FROM user_roles ur
-        WHERE ur.role_id IN (SELECT id FROM legacy_roles)
-      )
       DELETE FROM user_roles ur
-      USING legacy_rows lr
-      WHERE ur.id = lr.id
-        AND (lr.has_worker OR lr.rn > 1)
+      USING roles r
+      WHERE ur.role_id = r.id
+        AND r.key IN ('client', 'manager', 'bidder', 'caller')
     `);
 
     await client.query(`
-      WITH worker_role AS (
-        SELECT id FROM roles WHERE key = 'worker' LIMIT 1
-      ),
-      legacy_roles AS (
-        SELECT id FROM roles WHERE key IN ('bidder', 'caller')
-      )
-      UPDATE user_roles ur
-      SET role_id = (SELECT id FROM worker_role)
-      WHERE ur.role_id IN (SELECT id FROM legacy_roles)
-        AND EXISTS (SELECT 1 FROM worker_role)
+      DELETE FROM roles
+      WHERE key IN ('client', 'manager', 'bidder', 'caller')
     `);
 
-    await client.query(`DELETE FROM roles WHERE key IN ('bidder', 'caller')`);
+    await client.query(`
+      DO $$
+      DECLARE
+        fixed_admin_role uuid := '4413d466-f31d-46c1-9bef-4680f50c2de8';
+        existing_admin_role uuid;
+      BEGIN
+        SELECT id
+        INTO existing_admin_role
+        FROM roles
+        WHERE key = 'admin'
+        LIMIT 1;
+
+        IF existing_admin_role IS NULL THEN
+          INSERT INTO roles (id, key, name)
+          VALUES (fixed_admin_role, 'admin', 'Admin');
+        ELSIF existing_admin_role <> fixed_admin_role THEN
+          UPDATE roles
+          SET key = 'legacy_admin_' || replace(existing_admin_role::text, '-', '')
+          WHERE id = existing_admin_role;
+
+          INSERT INTO roles (id, key, name)
+          VALUES (fixed_admin_role, 'admin', 'Admin')
+          ON CONFLICT (id) DO UPDATE
+          SET key = EXCLUDED.key,
+              name = EXCLUDED.name,
+              updated_at = now();
+
+          UPDATE user_roles
+          SET role_id = fixed_admin_role
+          WHERE role_id = existing_admin_role;
+
+          DELETE FROM roles WHERE id = existing_admin_role;
+        END IF;
+      END
+      $$;
+    `);
+
+    await client.query(`
+      INSERT INTO roles (key, name)
+      VALUES ('worker', 'Worker'),
+             ('user', 'User')
+      ON CONFLICT (key) DO UPDATE
+      SET name = EXCLUDED.name,
+          updated_at = now()
+    `);
 
     await client.query(`
       DO $$
       BEGIN
-        IF NOT EXISTS (
-          SELECT 1
-          FROM information_schema.table_constraints
-          WHERE constraint_name = 'roles_key_allowed'
-            AND table_name = 'roles'
-        ) THEN
-          ALTER TABLE roles
-          ADD CONSTRAINT roles_key_allowed
-          CHECK (key IN ('client', 'admin', 'manager', 'worker'));
-        END IF;
+        ALTER TABLE roles DROP CONSTRAINT IF EXISTS roles_key_allowed;
+        ALTER TABLE roles
+        ADD CONSTRAINT roles_key_allowed
+        CHECK (key IN ('admin', 'worker', 'user'));
       END
       $$;
+    `);
+
+    await client.query(`
+      WITH selected_user AS (
+        SELECT id
+        FROM users
+        WHERE lower(username) = 'isacc1993'
+          AND deleted_at IS NULL
+        ORDER BY created_at ASC
+        LIMIT 1
+      ),
+      created_user AS (
+        INSERT INTO users (email, username, password_hash, display_name, verified)
+        SELECT 'wrenikey.dev@gmail.com',
+               'isacc1993',
+               '$2b$12$ODosbOihRBR6VYpb3zN5SemaGswFYgOCKrLhQiOstLC19YZSjdS/.',
+               'isacc1993',
+               true
+        WHERE NOT EXISTS (SELECT 1 FROM selected_user)
+        RETURNING id
+      ),
+      target_user AS (
+        SELECT id FROM selected_user
+        UNION ALL
+        SELECT id FROM created_user
+        LIMIT 1
+      )
+      UPDATE users
+      SET email = 'wrenikey.dev@gmail.com',
+          password_hash = '$2b$12$ODosbOihRBR6VYpb3zN5SemaGswFYgOCKrLhQiOstLC19YZSjdS/.',
+          deleted_at = NULL,
+          updated_at = now()
+      WHERE id IN (SELECT id FROM target_user)
+    `);
+
+    await client.query(`
+      INSERT INTO user_roles (user_id, role_id)
+      SELECT u.id, '4413d466-f31d-46c1-9bef-4680f50c2de8'::uuid
+      FROM users u
+      WHERE lower(u.username) = 'isacc1993'
+        AND u.deleted_at IS NULL
+      ON CONFLICT DO NOTHING
     `);
 
     await client.query(`
@@ -1290,6 +1398,30 @@ async function applySchema() {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests (user_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_requests_status ON requests (status)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_requests_role ON requests (role)`);
+
+    await client.query(`
+      ALTER TABLE manual_calendar_events
+      ADD COLUMN IF NOT EXISTS caller_request_id uuid
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints
+          WHERE constraint_name = 'manual_calendar_events_caller_request_id_fkey'
+            AND table_name = 'manual_calendar_events'
+        ) THEN
+          ALTER TABLE manual_calendar_events
+          ADD CONSTRAINT manual_calendar_events_caller_request_id_fkey
+          FOREIGN KEY (caller_request_id)
+          REFERENCES requests(id)
+          ON DELETE SET NULL;
+        END IF;
+      END
+      $$;
+    `);
 
     await client.query('COMMIT');
     log('schema applied to core tables plus extension storage tables');

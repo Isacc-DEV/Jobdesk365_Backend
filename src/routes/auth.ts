@@ -8,7 +8,7 @@ import path from 'path';
 import { config } from '../config.js';
 import { query } from '../db.js';
 import { hashPassword, comparePassword } from '../utils/password.js';
-import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { INTERNAL_WORKER_BLOCK_MESSAGE, authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
 const USERNAME_RE = /^[a-z0-9]+$/;
@@ -48,6 +48,9 @@ type UserRow = UserTokenData & {
   updated_at: string | Date;
   password_hash?: string;
   deleted_at?: string | Date | null;
+  roles?: string[];
+  is_internal_account?: boolean;
+  blocked_at?: string | Date | null;
 };
 
 function getAvatarExtension(file: Express.Multer.File) {
@@ -79,7 +82,7 @@ function signUser(user: UserTokenData) {
 }
 
 router.post('/register', async (req, res, next) => {
-  const { email, username, password, display_name, bio, photo_link, plan } = req.body || {};
+  const { email, username, password, display_name, bio, photo_link, plan, is_internal_user } = req.body || {};
   if (!email || !username || !password) {
     return res.status(400).json({ error: 'missing_required_fields' });
   }
@@ -90,22 +93,75 @@ router.post('/register', async (req, res, next) => {
     return res.status(400).json({ error: 'invalid_plan' });
   }
   try {
-    const existingUsername = await query(
-      `SELECT 1 FROM users WHERE lower(username) = lower($1::text) AND deleted_at IS NULL LIMIT 1`,
-      [username]
+    const targetIsInternal = Boolean(is_internal_user);
+    const existingIdentities = await query<{
+      email_match: boolean;
+      username_match: boolean;
+      is_internal_account: boolean;
+    }>(
+      `SELECT lower(u.email) = lower($1::text) AS email_match,
+              lower(u.username) = lower($2::text) AS username_match,
+              EXISTS (
+                SELECT 1
+                FROM user_roles ur
+                JOIN roles r ON r.id = ur.role_id
+                WHERE ur.user_id = u.id
+                  AND r.key IN ('admin', 'worker')
+              ) AS is_internal_account
+       FROM users u
+       WHERE u.deleted_at IS NULL
+         AND (lower(u.email) = lower($1::text) OR lower(u.username) = lower($2::text))`,
+      [email, username]
     );
-    if (existingUsername.rowCount) {
+
+    const conflictingRows = existingIdentities.rows.filter(
+      (row) => Boolean(row.is_internal_account) === targetIsInternal
+    );
+    if (conflictingRows.some((row) => row.username_match)) {
       return res.status(409).json({ error: 'username_taken' });
+    }
+    if (conflictingRows.some((row) => row.email_match)) {
+      return res.status(409).json({ error: 'email_taken' });
     }
 
     const password_hash = await hashPassword(password);
+    const verified = !targetIsInternal;
     const { rows } = await query<UserRow>(
-      `INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::plan_type, 'free'::plan_type))
+      `INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan, verified)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::plan_type, 'free'::plan_type), $8)
        RETURNING id, email, username, display_name, bio, photo_link, plan, balance, verified, created_at, updated_at`,
-      [email, username, password_hash, display_name ?? null, bio ?? null, photo_link ?? null, plan]
+      [email, username, password_hash, display_name ?? null, bio ?? null, photo_link ?? null, plan, verified]
     );
     const user = rows[0];
+
+    const roleRows = await query<{ id: string; key: string }>(
+      `SELECT id, key
+       FROM roles
+       WHERE key IN ('user', 'worker')`
+    );
+    const roleByKey = roleRows.rows.reduce<Record<string, string>>((acc, row) => {
+      acc[row.key] = row.id;
+      return acc;
+    }, {});
+
+    if (roleByKey.user) {
+      await query(
+        `INSERT INTO user_roles (user_id, role_id)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING`,
+        [user.id, roleByKey.user]
+      );
+    }
+
+    if (is_internal_user && roleByKey.worker) {
+      await query(
+        `INSERT INTO user_roles (user_id, role_id)
+         VALUES ($1, $2)
+         ON CONFLICT DO NOTHING`,
+        [user.id, roleByKey.worker]
+      );
+    }
+
     const token = signUser(user);
     return res.status(201).json({ token, user });
   } catch (err) {
@@ -124,17 +180,51 @@ router.post('/login', async (req, res, next) => {
   if (!email || !password) return res.status(400).json({ error: 'missing_credentials' });
   try {
     const { rows } = await query<UserRow>(
-      `SELECT id, email, username, password_hash, display_name, bio, photo_link, plan, balance, verified, deleted_at
+      `SELECT id,
+              email,
+              username,
+              password_hash,
+              display_name,
+              bio,
+              photo_link,
+              plan,
+              balance,
+              verified,
+              blocked_at,
+              deleted_at,
+              ARRAY(
+                SELECT r.key
+                FROM user_roles ur
+                JOIN roles r ON r.id = ur.role_id
+                WHERE ur.user_id = users.id
+              ) AS roles
        FROM users
        WHERE lower(email) = lower($1::text)
-       ORDER BY deleted_at NULLS FIRST
-       LIMIT 1`,
+         AND deleted_at IS NULL
+       ORDER BY created_at ASC`,
       [email]
     );
-    const user = rows[0];
-    if (!user || user.deleted_at) return res.status(401).json({ error: 'invalid_credentials' });
-    const ok = await comparePassword(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+    let user: UserRow | null = null;
+    for (const candidate of rows) {
+      const ok = await comparePassword(password, candidate.password_hash || '');
+      if (!ok) continue;
+      user = candidate;
+      break;
+    }
+    if (!user) return res.status(401).json({ error: 'invalid_credentials' });
+    if (user.blocked_at) {
+      return res.status(403).json({
+        error: 'account_blocked',
+        message: 'Your account is blocked. Please contact support team.'
+      });
+    }
+    const roles = Array.isArray(user.roles) ? user.roles.map((role) => String(role || '').toLowerCase()) : [];
+    if (!user.verified && roles.includes('worker')) {
+      return res.status(403).json({
+        error: 'worker_not_verified',
+        message: INTERNAL_WORKER_BLOCK_MESSAGE
+      });
+    }
     delete user.password_hash;
     const forwardedFor = Array.isArray(req.headers['x-forwarded-for'])
       ? req.headers['x-forwarded-for'][0]
@@ -263,7 +353,20 @@ router.put('/me', authRequired, fetchCurrentUser, async (req, res, next) => {
        WHERE ur.user_id = $1`,
       [req.currentUser.id]
     );
-    return res.json({ ...user, roles: roleRows.map((row) => row.key) });
+    let badges: string[] = [];
+    try {
+      const { rows: badgeRows } = await query<{ key: string }>(
+        `SELECT DISTINCT COALESCE(ub.badge_key, ub.talent_role) AS key
+         FROM user_badges ub
+         WHERE COALESCE(ub.user_id, ub.id) = $1
+           AND COALESCE(ub.badge_key, ub.talent_role) IS NOT NULL`,
+        [req.currentUser.id]
+      );
+      badges = badgeRows.map((row) => row.key);
+    } catch (err) {
+      badges = [];
+    }
+    return res.json({ ...user, roles: roleRows.map((row) => row.key), badges });
   } catch (err) {
     next(err);
   }

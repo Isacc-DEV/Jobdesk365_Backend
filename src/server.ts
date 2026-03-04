@@ -19,6 +19,7 @@ import billingRoutes from './routes/billing.js';
 import notificationsRoutes from './routes/notifications.js';
 import { initChatRealtime } from './realtime/chatRealtime.js';
 import { startNotificationScheduler } from './services/notificationScheduler.js';
+import { initAuthData } from './bootstrap/initAuthData.js';
 
 const app = express();
 
@@ -88,6 +89,9 @@ const server = http.createServer(app);
 initChatRealtime(server);
 startNotificationScheduler();
 
-server.listen(config.port, () => {
-  console.log(`API listening on http://localhost:${config.port}`);
-});
+void (async () => {
+  await initAuthData();
+  server.listen(config.port, () => {
+    console.log(`API listening on http://localhost:${config.port}`);
+  });
+})();

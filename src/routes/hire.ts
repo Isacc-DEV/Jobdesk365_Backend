@@ -1,10 +1,11 @@
-import express from 'express';
+﻿import express from 'express';
 import multer from 'multer';
 import fs from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { canAccessManagerScope, isAdmin } from '../lib/accessControl.js';
 import {
   notifyAssignBidderRequest,
   notifyAssignCallerRequest,
@@ -22,9 +23,6 @@ const BIDDER_BASE_RATE = 0.07;
 const CALLER_BASE_RATE = 0.5;
 const TALENT_IMAGES_DIR = path.resolve(process.cwd(), 'uploads', 'talents');
 
-const hasRole = (roles: string[] | null | undefined, role: string) =>
-  Array.isArray(roles) && roles.includes(role);
-
 const getRouteScope = (baseUrl: string | undefined): RouteScope => {
   if (!baseUrl) return 'user';
   if (baseUrl.startsWith('/admin/')) return 'admin';
@@ -39,10 +37,10 @@ const getScopeContext = (req: express.Request) => {
 
 const requireScopeAccess: express.RequestHandler = (req, res, next) => {
   const scope = getRouteScope(req.baseUrl);
-  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+  if (scope === 'admin' && !isAdmin(req.currentUser?.roles)) {
     return res.status(403).json({ error: 'admin_required' });
   }
-  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+  if (scope === 'manager' && !canAccessManagerScope(req.currentUser)) {
     return res.status(403).json({ error: 'manager_required' });
   }
   return next();
@@ -133,6 +131,14 @@ const ensureHireSchema = async () => {
       DO $$
       BEGIN
         IF EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'talents'
+        ) AND NOT EXISTS (
+          SELECT 1 FROM information_schema.tables WHERE table_name = 'user_badges'
+        ) THEN
+          ALTER TABLE talents RENAME TO user_badges;
+        END IF;
+
+        IF EXISTS (
           SELECT 1 FROM information_schema.tables WHERE table_name = 'hire_people'
         ) AND NOT EXISTS (
           SELECT 1 FROM information_schema.tables WHERE table_name = 'talents'
@@ -149,6 +155,17 @@ const ensureHireSchema = async () => {
         END IF;
       END
       $$;
+    `);
+
+    await query(`
+      ALTER TABLE user_badges
+      ADD COLUMN IF NOT EXISTS badge_key text
+    `);
+
+    await query(`
+      UPDATE user_badges
+      SET badge_key = talent_role
+      WHERE badge_key IS NULL AND talent_role IS NOT NULL
     `);
 
     await query(`
@@ -274,70 +291,6 @@ const ensureHireSchema = async () => {
       WHERE r.key IN ('bidder', 'caller')
       ON CONFLICT (id, talent_role) DO NOTHING
     `);
-
-    await query(
-      `
-      WITH mock_talents (email, username, display_name, bio, role_key, rate, img_url, phone_number, whatsapp, telegram, skill) AS (
-        VALUES
-          ('mock.caller1@jobdesk.local', 'caller.one', 'Callie Stone', 'Customer-focused caller with a calm tone.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-1.jpg', '555-0101', '555-0101', 'caller.one', 'Outbound calling'),
-          ('mock.caller2@jobdesk.local', 'caller.two', 'Noah Reed', 'Fast, friendly outreach and follow-up specialist.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-2.jpg', '555-0102', '555-0102', 'caller.two', 'Lead follow-up'),
-          ('mock.caller3@jobdesk.local', 'caller.three', 'Ava Brooks', 'Empathetic caller with experience in pipelines.', 'caller', ${CALLER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/caller-3.jpg', '555-0103', '555-0103', 'caller.three', 'Pipeline outreach'),
-          ('mock.bidder1@jobdesk.local', 'bidder.one', 'Ethan Park', 'High-volume application specialist.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-1.jpg', '555-0201', '555-0201', 'bidder.one', 'Applications'),
-          ('mock.bidder2@jobdesk.local', 'bidder.two', 'Mia Patel', 'Accurate and fast bidder with ATS expertise.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-2.jpg', '555-0202', '555-0202', 'bidder.two', 'ATS bids'),
-          ('mock.bidder3@jobdesk.local', 'bidder.three', 'Lucas Ortiz', 'Detail-oriented application optimizer.', 'bidder', ${BIDDER_BASE_RATE}, 'https://your-project.supabase.co/storage/v1/object/public/talents/bidder-3.jpg', '555-0203', '555-0203', 'bidder.three', 'Application targeting')
-      ),
-      ensured_users AS (
-        INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan)
-        SELECT mt.email, mt.username, $1, mt.display_name, mt.bio, NULL, 'free'
-        FROM mock_talents mt
-        WHERE NOT EXISTS (
-          SELECT 1 FROM users u WHERE lower(u.email) = lower(mt.email)
-        )
-        RETURNING id, email
-      ),
-      all_users AS (
-        SELECT u.id, u.email
-        FROM users u
-        JOIN mock_talents mt ON lower(u.email) = lower(mt.email)
-      ),
-      role_links AS (
-        INSERT INTO user_roles (user_id, role_id)
-        SELECT au.id, r.id
-        FROM all_users au
-        JOIN mock_talents mt ON lower(mt.email) = lower(au.email)
-        JOIN roles r ON r.key = 'worker'
-        ON CONFLICT DO NOTHING
-      )
-      INSERT INTO talents (id, user_id, talent_role, name, bio, skill, email, phone_number, whatsapp, telegram, rate, img_url)
-      SELECT au.id,
-             au.id,
-             mt.role_key,
-             mt.display_name,
-             mt.bio,
-             mt.skill,
-             mt.email,
-             mt.phone_number,
-             mt.whatsapp,
-             mt.telegram,
-             mt.rate,
-             mt.img_url
-      FROM all_users au
-      JOIN mock_talents mt ON lower(mt.email) = lower(au.email)
-      ON CONFLICT (id, talent_role) DO UPDATE SET
-        user_id = EXCLUDED.user_id,
-        talent_role = EXCLUDED.talent_role,
-        name = EXCLUDED.name,
-        bio = EXCLUDED.bio,
-        skill = EXCLUDED.skill,
-        email = EXCLUDED.email,
-        phone_number = EXCLUDED.phone_number,
-        whatsapp = EXCLUDED.whatsapp,
-        telegram = EXCLUDED.telegram,
-        rate = EXCLUDED.rate,
-        img_url = EXCLUDED.img_url
-      `,
-      ['$2b$10$N9qo8uLOickgx2ZMRZo5e.Puq8No3BFEtGYwd5j9Vn0iJrO9wBLs.']
-    );
 
     await query(`
       CREATE TABLE IF NOT EXISTS app_data_migrations (
@@ -481,6 +434,23 @@ const normalizeDetail = (value: unknown) => {
 const normalizeCallerDetail = (value: unknown) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
+  const source = String(raw.source || '').trim().toLowerCase();
+  if (source === 'calendar_manual') {
+    const eventId = String(raw.event_id || raw.eventId || '').trim();
+    if (!eventId) return null;
+    const profileId = String(raw.profile_id || raw.profileId || '').trim();
+    const profileName = String(raw.profile_name || raw.profileName || '').trim();
+    const title = String(raw.title || '').trim();
+    const note = String(raw.note || raw.other || raw.notes || '').trim();
+    return {
+      source: 'calendar_manual',
+      event_id: eventId,
+      profile_id: profileId || null,
+      profile_name: profileName || null,
+      title: title || null,
+      note: note || ''
+    };
+  }
   const jobUrl = raw.job_url ?? raw.jobUrl ?? '';
   const meetingUrl = raw.meeting_url ?? raw.meetingUrl ?? '';
   const other = raw.other ?? raw.notes ?? '';
@@ -511,28 +481,38 @@ const listTalents = async (req, res, next) => {
 
   try {
     const { rows } = await query(
-      `SELECT t.id,
-              COALESCE(t.user_id, t.id) AS user_id,
-              t.talent_role AS role,
-              t.name,
+      `SELECT u.id,
+              COALESCE(ub.user_id, ub.id, u.id) AS user_id,
+              COALESCE(ub.badge_key, ub.talent_role) AS role,
+              COALESCE(ub.name, u.display_name, u.username, u.email) AS name,
               u.display_name,
               u.username,
-              t.bio,
-              t.skill,
-              t.email,
-              t.phone_number,
-              t.whatsapp,
-              t.telegram,
+              ub.bio,
+              ub.skill,
+              COALESCE(ub.email, u.email) AS email,
+              ub.phone_number,
+              ub.whatsapp,
+              ub.telegram,
               COALESCE(
-                t.rate,
-                CASE WHEN t.talent_role = 'caller' THEN ${CALLER_BASE_RATE} ELSE ${BIDDER_BASE_RATE} END
+                ub.rate,
+                CASE
+                  WHEN COALESCE(ub.badge_key, ub.talent_role) = 'caller' THEN ${CALLER_BASE_RATE}
+                  ELSE ${BIDDER_BASE_RATE}
+                END
               ) AS rate,
-              t.img_url
-       FROM talents t
-       JOIN users u ON u.id = COALESCE(t.user_id, t.id)
-       WHERE t.talent_role = $1
-         AND u.deleted_at IS NULL
-       ORDER BY t.name NULLS LAST, t.email NULLS LAST`,
+              ub.img_url
+       FROM users u
+       JOIN user_badges ub ON COALESCE(ub.user_id, ub.id) = u.id
+       WHERE COALESCE(ub.badge_key, ub.talent_role) = $1
+         AND EXISTS (
+           SELECT 1
+           FROM user_roles ur
+           JOIN roles r ON r.id = ur.role_id
+           WHERE ur.user_id = u.id
+             AND r.key = 'worker'
+         )
+          AND u.deleted_at IS NULL
+       ORDER BY COALESCE(ub.name, u.display_name, u.username, u.email) NULLS LAST, COALESCE(ub.email, u.email) NULLS LAST`,
       [role]
     );
     res.json({ items: rows });
@@ -550,8 +530,38 @@ router.get('/users', async (req, res, next) => {
     return res.status(403).json({ error: 'forbidden' });
   }
   const q = typeof req.query?.q === 'string' ? req.query.q.trim() : '';
-  if (!q) return res.json({ items: [] });
+  const context = typeof req.query?.context === 'string' ? req.query.context.trim() : '';
   try {
+    if (context === 'profile_owner') {
+      const params: unknown[] = [req.currentUser.id];
+      let searchFilter = '';
+      if (q) {
+        params.push(`%${q}%`);
+        searchFilter = `AND (u.email ILIKE $2 OR u.username ILIKE $2 OR u.display_name ILIKE $2)`;
+      }
+      const { rows } = await query(
+        `SELECT u.id, u.email, u.username, u.display_name
+         FROM users u
+         WHERE u.deleted_at IS NULL
+           ${searchFilter}
+           AND (
+             u.id = $1
+             OR NOT EXISTS (
+               SELECT 1
+               FROM user_roles ur
+               JOIN roles r ON r.id = ur.role_id
+               WHERE ur.user_id = u.id
+                 AND r.key IN ('admin', 'worker')
+             )
+           )
+         ORDER BY (u.id = $1) DESC, u.created_at DESC`,
+        params
+      );
+      return res.json({ items: rows });
+    }
+
+    if (!q) return res.json({ items: [] });
+
     const { rows } = await query(
       `SELECT id, email, username, display_name
        FROM users
@@ -792,7 +802,7 @@ router.post('/talents/me/image', (req, res, next) => {
 });
 
 router.patch('/talents/:userId', async (req, res, next) => {
-  if (!hasRole(req.currentUser?.roles, 'admin')) {
+  if (!isAdmin(req.currentUser?.roles)) {
     return res.status(403).json({ error: 'admin_required' });
   }
 
@@ -1139,3 +1149,4 @@ router.delete('/requests/:requestId', async (req, res, next) => {
 });
 
 export default router;
+

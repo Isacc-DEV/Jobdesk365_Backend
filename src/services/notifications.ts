@@ -1,6 +1,6 @@
-import { query } from '../db.js';
+﻿import { query } from '../db.js';
 import { NOTIFICATION_TYPES, type NotificationType } from '../constants/notificationTypes.js';
-import { ADMIN_MANAGER_ROLE_KEYS, type RoleKey } from '../constants/roles.js';
+import { ADMIN_WORKER_ROLE_KEYS, type RoleKey } from '../constants/roles.js';
 
 type CursorRow = { created_at: string | Date; id: string };
 
@@ -255,7 +255,7 @@ export async function markAllNotificationsRead(userId: string): Promise<number> 
   return rowCount ?? 0;
 }
 
-const getAdminManagerUserIds = async () => getUserIdsByRoleKeys(ADMIN_MANAGER_ROLE_KEYS);
+const getAdminManagerUserIds = async () => getUserIdsByRoleKeys(ADMIN_WORKER_ROLE_KEYS);
 
 export async function notifyResumeTemplateAdded(templateTitle: string) {
   const recipients = await getAllActiveUserIds();
@@ -319,7 +319,7 @@ async function notifyBidderRequestWithRoleAwareRedirect(input: {
   recipients: string[];
 }) {
   const { withRoles: adminManagerRecipients, withoutRoles: userRecipients } =
-    await partitionUsersByRoleKeys(input.recipients, ADMIN_MANAGER_ROLE_KEYS);
+    await partitionUsersByRoleKeys(input.recipients, ADMIN_WORKER_ROLE_KEYS);
 
   await Promise.all([
     createNotifications({
@@ -394,7 +394,7 @@ export async function notifyAssignCallerRequest(input: {
   ]);
 
   const { withRoles: adminManagerRecipients, withoutRoles: callerOrUserRecipients } =
-    await partitionUsersByRoleKeys(recipients, ADMIN_MANAGER_ROLE_KEYS);
+    await partitionUsersByRoleKeys(recipients, ADMIN_WORKER_ROLE_KEYS);
 
   await Promise.all([
     createNotifications({
@@ -494,3 +494,4 @@ export async function createInterviewReminderNotifications(offsetMinutes: 30 | 5
 
   return rowCount ?? 0;
 }
+

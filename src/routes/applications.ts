@@ -1,14 +1,12 @@
-import express from 'express';
+﻿import express from 'express';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { canAccessManagerScope, isAdmin } from '../lib/accessControl.js';
 
 const router = express.Router();
 type RouteScope = 'user' | 'manager' | 'admin';
 
 let applicationsSchemaPromise: Promise<void> | null = null;
-const hasRole = (roles: string[] | null | undefined, role: string) =>
-  Array.isArray(roles) && roles.includes(role);
-
 const getRouteScope = (baseUrl: string | undefined): RouteScope => {
   if (!baseUrl) return 'user';
   if (baseUrl.startsWith('/admin/')) return 'admin';
@@ -145,10 +143,10 @@ const getLatestBidTimestamp = (bids: any[]) => {
 router.use(authRequired, fetchCurrentUser);
 router.use((req, res, next) => {
   const scope = getRouteScope(req.baseUrl);
-  if (scope === 'admin' && !hasRole(req.currentUser?.roles, 'admin')) {
+  if (scope === 'admin' && !isAdmin(req.currentUser?.roles)) {
     return res.status(403).json({ error: 'admin_required' });
   }
-  if (scope === 'manager' && !hasRole(req.currentUser?.roles, 'manager')) {
+  if (scope === 'manager' && !canAccessManagerScope(req.currentUser)) {
     return res.status(403).json({ error: 'manager_required' });
   }
   return next();
@@ -354,3 +352,4 @@ router.delete('/:applicationId', async (req, res, next) => {
 });
 
 export default router;
+

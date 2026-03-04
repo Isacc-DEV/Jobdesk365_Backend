@@ -451,14 +451,22 @@ const DEFAULT_TEMPLATE_HTML = `<!doctype html>
     <div>{{Profile.headline}}</div>
     <div>{{Profile.contact.location}} | {{Profile.contact.email}} | {{Profile.contact.phone}}</div>
     <hr />
+    {{#hasSummary}}
     <h2>Summary</h2>
     <div>{{summary.text}}</div>
+    {{/hasSummary}}
+    {{#hasWorkExperience}}
     <h2>Experience</h2>
     {{workExperience}}
+    {{/hasWorkExperience}}
+    {{#hasEducation}}
     <h2>Education</h2>
     {{education}}
+    {{/hasEducation}}
+    {{#hasSkills}}
     <h2>Skills</h2>
     <div>{{skills.raw}}</div>
+    {{/hasSkills}}
   </body>
 </html>`;
 
@@ -639,12 +647,14 @@ const normalizeResumeEducation = (value: any) => {
         .split('\n')
         .map((item) => item.trim())
         .filter(Boolean);
+  const dateRaw = asString(pickValue(value, ['date', 'graduationDate', 'endDate'])) || '';
+  const normalizedDate = normalizeResumeDateInput(dateRaw, { allowPresent: false });
 
   return {
     institution: asString(pickValue(value, ['institution', 'school', 'schoolName'])) || '',
     degree: asString(pickValue(value, ['degree'])) || '',
     field: asString(pickValue(value, ['field', 'major'])) || '',
-    date: asString(pickValue(value, ['date', 'graduationDate', 'endDate'])) || '',
+    date: normalizedDate.isValid ? normalizedDate.value : dateRaw,
     coursework
   };
 };
@@ -796,9 +806,10 @@ const mergeExtensionProfile = (baseInfo: any, payload: any) => {
 router.get('/profiles', async (req, res, next) => {
   try {
     const userRoles = req.currentUser?.roles || [];
+    const userBadges = req.currentUser?.badges || [];
     const isAdmin = userRoles.includes('admin');
-    const isManager = userRoles.includes('manager');
-    const isBidder = userRoles.includes('bidder');
+    const isManager = userRoles.includes('worker') && userBadges.includes('manager');
+    const isBidder = userBadges.includes('bidder');
     
     let whereClause = 'p.deleted_at IS NULL';
     let params: any[] = [];
@@ -864,7 +875,7 @@ router.post('/profiles', async (req, res, next) => {
   if (normalizedResumeResult.issues.length > 0) {
     return res.status(400).json({
       error: 'invalid_resume_date',
-      message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+      message: 'Invalid work experience date format. Use MM/YYYY, and use Present only for endDate.',
       issues: mapResumeDateIssues(normalizedResumeResult.issues)
     });
   }
@@ -968,7 +979,7 @@ router.patch('/profiles/:profileId', async (req, res, next) => {
       if (normalizedResumeResult.issues.length > 0) {
         return res.status(400).json({
           error: 'invalid_resume_date',
-          message: 'Invalid work experience date format. Use MM/YY, and use Present only for endDate.',
+          message: 'Invalid work experience date format. Use MM/YYYY, and use Present only for endDate.',
           issues: mapResumeDateIssues(normalizedResumeResult.issues)
         });
       }

@@ -1,15 +1,16 @@
-import express from 'express';
+﻿import express from 'express';
 import { chromium, type Browser } from 'playwright';
 import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { notifyResumeTemplateAdded } from '../services/notifications.js';
+import { canAccessManagerScope, isAdmin } from '../lib/accessControl.js';
 
 const router = express.Router();
 
 router.use(authRequired, fetchCurrentUser);
 
-const isAdminOrManager = (roles?: string[] | null) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager');
+const isAdminOrManager = (user?: { roles?: string[] | null; badges?: string[] | null } | null) =>
+  isAdmin(user?.roles) || canAccessManagerScope(user);
 
 const buildSafePdfFilename = (value?: string) => {
   const base =
@@ -187,7 +188,7 @@ router.get('/:templateId', async (req, res, next) => {
 router.patch('/:templateId', async (req, res, next) => {
   const { title, name, description, code, html } = req.body || {};
   const updates: string[] = [];
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
+  const allowAll = isAdminOrManager(req.currentUser);
   const params: unknown[] = [req.params.templateId];
   let idx = params.length + 1;
 
@@ -231,7 +232,7 @@ router.patch('/:templateId', async (req, res, next) => {
 
 // Soft delete template
 router.delete('/:templateId', async (req, res, next) => {
-  const allowAll = isAdminOrManager(req.currentUser?.roles);
+  const allowAll = isAdminOrManager(req.currentUser);
   try {
     const { rowCount } = await query(
       `UPDATE resume_templates
@@ -247,3 +248,4 @@ router.delete('/:templateId', async (req, res, next) => {
 });
 
 export default router;
+

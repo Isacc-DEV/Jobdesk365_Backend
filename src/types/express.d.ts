@@ -18,9 +18,11 @@ declare global {
         plan: string;
         balance: number;
         verified: boolean;
+        blocked_at?: string | Date | null;
         last_login_at: string | Date | null;
         last_login_place: string | null;
         roles: string[];
+        badges: string[];
         created_at: string | Date;
         updated_at: string | Date;
       };

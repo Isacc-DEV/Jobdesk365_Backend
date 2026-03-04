@@ -1,8 +1,8 @@
-import express from 'express';
+﻿import express from 'express';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 import { createNotifications, ensureNotificationSchema, listNotificationsForUser, markAllNotificationsRead } from '../services/notifications.js';
 import { NOTIFICATION_TYPES, type NotificationType } from '../constants/notificationTypes.js';
-import { ADMIN_MANAGER_ROLE_KEYS } from '../constants/roles.js';
+import { ADMIN_WORKER_ROLE_KEYS } from '../constants/roles.js';
 
 const router = express.Router();
 
@@ -54,7 +54,7 @@ router.post('/mark-all-read', async (req, res, next) => {
 });
 
 router.post('/create', async (req, res, next) => {
-  if (!hasAnyRole(req.currentUser?.roles, ADMIN_MANAGER_ROLE_KEYS)) {
+  if (!hasAnyRole(req.currentUser?.roles, ADMIN_WORKER_ROLE_KEYS)) {
     return res.status(403).json({ error: 'forbidden' });
   }
 
@@ -89,3 +89,4 @@ router.post('/create', async (req, res, next) => {
 });
 
 export default router;
+

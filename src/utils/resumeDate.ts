@@ -1,4 +1,4 @@
-type ResumeDateField = 'startDate' | 'endDate';
+type ResumeDateField = 'startDate' | 'endDate' | 'date';
 
 export type ResumeDateIssue = {
   key: string;
@@ -21,6 +21,7 @@ type NormalizeResumeDateResult = {
 
 const PRESENT_LABEL = 'Present';
 const WORK_EXPERIENCE_KEYS = ['workExperience', 'work_experience', 'experience'] as const;
+const EDUCATION_KEYS = ['education', 'educationHistory'] as const;
 
 const toTrimmedString = (value: unknown): string => {
   if (value === null || value === undefined) return '';
@@ -31,8 +32,8 @@ const normalizeMonthYear = (monthRaw: string, yearRaw: string): string | null =>
   const month = Number(monthRaw);
   if (!Number.isInteger(month) || month < 1 || month > 12) return null;
   if (!/^(\d{2}|\d{4})$/.test(yearRaw)) return null;
-  const year2 = yearRaw.slice(-2);
-  return `${String(month).padStart(2, '0')}/${year2}`;
+  const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
+  return `${String(month).padStart(2, '0')}/${year}`;
 };
 
 const normalizeDateUsingPatterns = (value: string): string | null => {
@@ -80,7 +81,7 @@ export const normalizeResumeDateInput = (
     value,
     isValid: false,
     isEmpty: false,
-    error: `Invalid date "${value}". Expected MM/YY${allowPresent ? ' or Present' : ''}.`
+    error: `Invalid date "${value}". Expected MM/YYYY${allowPresent ? ' or Present' : ''}.`
   };
 };
 
@@ -165,6 +166,54 @@ const normalizeExperienceEntriesForKey = (
   return { entries: normalizedEntries, issues };
 };
 
+const normalizeEducationEntriesForKey = (
+  key: string,
+  items: unknown[]
+): { entries: unknown[]; issues: ResumeDateIssue[] } => {
+  const entries = items.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+
+    const entry = item as Record<string, unknown>;
+    const nextEntry: Record<string, unknown> = { ...entry };
+    const issues: ResumeDateIssue[] = [];
+    const dateRaw = readExperienceValue(entry, ['date', 'graduationDate', 'endDate']);
+    const normalizedDate = normalizeResumeDateInput(dateRaw, { allowPresent: false });
+
+    if (!normalizedDate.isValid) {
+      issues.push({
+        key,
+        index,
+        field: 'date',
+        value: normalizedDate.value,
+        message: normalizedDate.error || 'Invalid date.'
+      });
+    } else {
+      nextEntry.date = normalizedDate.value;
+      if ('graduationDate' in entry) {
+        nextEntry.graduationDate = normalizedDate.value;
+      }
+      if ('endDate' in entry) {
+        nextEntry.endDate = normalizedDate.value;
+      }
+    }
+
+    return { nextEntry, issues };
+  });
+
+  const issues = entries.flatMap((item) =>
+    item && typeof item === 'object' && !Array.isArray(item) && 'issues' in item
+      ? ((item as { issues: ResumeDateIssue[] }).issues || [])
+      : []
+  );
+  const normalizedEntries = entries.map((item) =>
+    item && typeof item === 'object' && !Array.isArray(item) && 'nextEntry' in item
+      ? (item as { nextEntry: Record<string, unknown> }).nextEntry
+      : item
+  );
+
+  return { entries: normalizedEntries, issues };
+};
+
 export const normalizeBaseResumeExperienceDates = (
   baseResume: unknown
 ): { resume: unknown; issues: ResumeDateIssue[] } => {
@@ -181,6 +230,15 @@ export const normalizeBaseResumeExperienceDates = (
     if (!Array.isArray(value)) continue;
 
     const normalized = normalizeExperienceEntriesForKey(key, value);
+    nextResume[key] = normalized.entries;
+    issues.push(...normalized.issues);
+  }
+
+  for (const key of EDUCATION_KEYS) {
+    const value = source[key];
+    if (!Array.isArray(value)) continue;
+
+    const normalized = normalizeEducationEntriesForKey(key, value);
     nextResume[key] = normalized.entries;
     issues.push(...normalized.issues);
   }

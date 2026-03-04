@@ -20,7 +20,7 @@ const connections = new Set<ConnectionInfo>();
 const presenceById = new Map<string, ConnectionInfo>();
 
 const isEmployeeRole = (roles?: string[]) =>
-  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'manager' || role === 'worker');
+  Array.isArray(roles) && roles.some((role) => role === 'admin' || role === 'worker');
 
 const toPresenceSnapshot = () => {
   const items: Array<{
