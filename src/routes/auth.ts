@@ -9,6 +9,7 @@ import { config } from '../config.js';
 import { query } from '../db.js';
 import { hashPassword, comparePassword } from '../utils/password.js';
 import { INTERNAL_WORKER_BLOCK_MESSAGE, authRequired, fetchCurrentUser } from '../middleware/auth.js';
+import { requireSupabaseAdminClient, requireSupabaseOtpClient } from '../services/supabaseAuth.js';
 
 const router = express.Router();
 const USERNAME_RE = /^[a-z0-9]+$/;
@@ -42,6 +43,9 @@ type UserRow = UserTokenData & {
   photo_link: string | null;
   balance?: number;
   verified: boolean;
+  email_verified_at?: string | Date | null;
+  email_verification_nonce?: string | null;
+  email_verification_requested_at?: string | Date | null;
   last_login_at?: string | Date | null;
   last_login_place?: string | null;
   created_at: string | Date;
@@ -81,9 +85,40 @@ function signUser(user: UserTokenData) {
   });
 }
 
+function normalizeEmail(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getVerificationRedirectUrl(nonce: string): string {
+  const url = new URL(config.auth.emailVerificationPath, config.frontendUrl);
+  url.searchParams.set('vnonce', nonce);
+  return url.toString();
+}
+
+async function sendVerificationEmail(email: string, nonce: string): Promise<void> {
+  const supabaseOtpClient = requireSupabaseOtpClient();
+  const { error } = await supabaseOtpClient.auth.signInWithOtp({
+    email,
+    options: {
+      shouldCreateUser: true,
+      emailRedirectTo: getVerificationRedirectUrl(nonce)
+    }
+  });
+  if (error) {
+    throw new Error(error.message || 'verification_failed');
+  }
+}
+
+function parseDateToEpochMs(value: string | Date | null | undefined): number | null {
+  if (!value) return null;
+  const epoch = new Date(value).getTime();
+  return Number.isFinite(epoch) ? epoch : null;
+}
+
 router.post('/register', async (req, res, next) => {
   const { email, username, password, display_name, bio, photo_link, plan, is_internal_user } = req.body || {};
-  if (!email || !username || !password) {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail || !username || !password) {
     return res.status(400).json({ error: 'missing_required_fields' });
   }
   if (!USERNAME_RE.test(username)) {
@@ -108,10 +143,10 @@ router.post('/register', async (req, res, next) => {
                 WHERE ur.user_id = u.id
                   AND r.key IN ('admin', 'worker')
               ) AS is_internal_account
-       FROM users u
+      FROM users u
        WHERE u.deleted_at IS NULL
          AND (lower(u.email) = lower($1::text) OR lower(u.username) = lower($2::text))`,
-      [email, username]
+      [normalizedEmail, username]
     );
 
     const conflictingRows = existingIdentities.rows.filter(
@@ -126,11 +161,46 @@ router.post('/register', async (req, res, next) => {
 
     const password_hash = await hashPassword(password);
     const verified = !targetIsInternal;
+    const verificationNonce = randomUUID();
     const { rows } = await query<UserRow>(
-      `INSERT INTO users (email, username, password_hash, display_name, bio, photo_link, plan, verified)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::plan_type, 'free'::plan_type), $8)
+      `INSERT INTO users (
+          email,
+          username,
+          password_hash,
+          display_name,
+          bio,
+          photo_link,
+          plan,
+          verified,
+          email_verified_at,
+          email_verification_nonce,
+          email_verification_requested_at
+       )
+       VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          COALESCE($7::plan_type, 'free'::plan_type),
+          $8,
+          NULL,
+          $9,
+          now()
+       )
        RETURNING id, email, username, display_name, bio, photo_link, plan, balance, verified, created_at, updated_at`,
-      [email, username, password_hash, display_name ?? null, bio ?? null, photo_link ?? null, plan, verified]
+      [
+        normalizedEmail,
+        username,
+        password_hash,
+        display_name ?? null,
+        bio ?? null,
+        photo_link ?? null,
+        plan,
+        verified,
+        verificationNonce
+      ]
     );
     const user = rows[0];
 
@@ -162,8 +232,26 @@ router.post('/register', async (req, res, next) => {
       );
     }
 
-    const token = signUser(user);
-    return res.status(201).json({ token, user });
+    if (!config.features.emailVerificationEnabled) {
+      const token = signUser(user);
+      return res.status(201).json({ token, user });
+    }
+
+    try {
+      await sendVerificationEmail(normalizedEmail, verificationNonce);
+    } catch {
+      await query(`DELETE FROM users WHERE id = $1`, [user.id]);
+      return res.status(503).json({
+        error: 'verification_unavailable',
+        message: 'Email verification is temporarily unavailable. Please try again later.'
+      });
+    }
+
+    return res.status(201).json({
+      status: 'verification_required',
+      email: normalizedEmail,
+      expires_in_seconds: config.auth.emailVerificationTtlSeconds
+    });
   } catch (err) {
     if (err.code === '23505') {
       // unique_violation
@@ -175,9 +263,134 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
+router.post('/email-verification/confirm', async (req, res, next) => {
+  if (!config.features.emailVerificationEnabled) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+  const header = req.headers.authorization;
+  const nonce = String(req.body?.nonce || '').trim();
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing_token' });
+  }
+  if (!nonce) {
+    return res.status(400).json({ error: 'missing_nonce' });
+  }
+  const accessToken = header.slice('Bearer '.length).trim();
+  if (!accessToken) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+
+  try {
+    const supabaseAdminClient = requireSupabaseAdminClient();
+    const {
+      data: { user: supabaseUser },
+      error: getUserError
+    } = await supabaseAdminClient.auth.getUser(accessToken);
+
+    if (getUserError || !supabaseUser?.email) {
+      return res.status(401).json({ error: 'invalid_token' });
+    }
+
+    const normalizedEmail = normalizeEmail(supabaseUser.email);
+    const { rows } = await query<UserRow>(
+      `SELECT id, email_verification_nonce, email_verification_requested_at, email_verified_at
+       FROM users
+       WHERE lower(email) = lower($1::text)
+         AND email_verification_nonce = $2
+         AND deleted_at IS NULL
+       ORDER BY created_at ASC`,
+      [normalizedEmail, nonce]
+    );
+    const user = rows[0];
+    if (!user) {
+      const existing = await query<UserRow>(
+        `SELECT email_verified_at
+         FROM users
+         WHERE lower(email) = lower($1::text)
+           AND deleted_at IS NULL
+         ORDER BY created_at ASC`,
+        [normalizedEmail]
+      );
+      if (existing.rows.some((row) => Boolean(row.email_verified_at))) {
+        return res.json({ status: 'verified' });
+      }
+      return res.status(400).json({ error: 'invalid_verification_nonce' });
+    }
+
+    const requestedAtMs = parseDateToEpochMs(user.email_verification_requested_at || null);
+    if (!requestedAtMs) {
+      return res.status(400).json({ error: 'verification_failed' });
+    }
+
+    const maxAgeMs = config.auth.emailVerificationTtlSeconds * 1000;
+    if (Date.now() - requestedAtMs > maxAgeMs) {
+      return res.status(400).json({ error: 'verification_link_expired' });
+    }
+
+    await query(
+      `UPDATE users
+       SET email_verified_at = now(),
+           email_verification_nonce = NULL,
+           email_verification_requested_at = NULL
+       WHERE id = $1`,
+      [user.id]
+    );
+
+    return res.json({ status: 'verified' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/email-verification/resend', async (req, res, next) => {
+  if (!config.features.emailVerificationEnabled) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+  const normalizedEmail = normalizeEmail(req.body?.email);
+  if (!normalizedEmail) {
+    return res.status(400).json({ error: 'missing_email' });
+  }
+
+  try {
+    const { rows } = await query<UserRow>(
+      `SELECT id, email_verified_at, email_verification_requested_at
+       FROM users
+       WHERE lower(email) = lower($1::text)
+         AND deleted_at IS NULL
+       ORDER BY created_at ASC`,
+      [normalizedEmail]
+    );
+    const user = rows[0];
+    if (!user || user.email_verified_at) {
+      return res.json({ status: 'verification_resent_if_eligible' });
+    }
+
+    const requestedAtMs = parseDateToEpochMs(user.email_verification_requested_at || null);
+    const cooldownMs = config.auth.emailVerificationResendCooldownSeconds * 1000;
+    if (requestedAtMs && Date.now() - requestedAtMs < cooldownMs) {
+      return res.json({ status: 'verification_resent_if_eligible' });
+    }
+
+    const verificationNonce = randomUUID();
+    await query(
+      `UPDATE users
+       SET email_verification_nonce = $1,
+           email_verification_requested_at = now()
+       WHERE id = $2`,
+      [verificationNonce, user.id]
+    );
+    await sendVerificationEmail(normalizedEmail, verificationNonce);
+
+    return res.json({ status: 'verification_resent_if_eligible' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/login', async (req, res, next) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'missing_credentials' });
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail || !password) return res.status(400).json({ error: 'missing_credentials' });
   try {
     const { rows } = await query<UserRow>(
       `SELECT id,
@@ -190,6 +403,7 @@ router.post('/login', async (req, res, next) => {
               plan,
               balance,
               verified,
+              email_verified_at,
               blocked_at,
               deleted_at,
               ARRAY(
@@ -202,7 +416,7 @@ router.post('/login', async (req, res, next) => {
        WHERE lower(email) = lower($1::text)
          AND deleted_at IS NULL
        ORDER BY created_at ASC`,
-      [email]
+      [normalizedEmail]
     );
     let user: UserRow | null = null;
     for (const candidate of rows) {
@@ -212,6 +426,12 @@ router.post('/login', async (req, res, next) => {
       break;
     }
     if (!user) return res.status(401).json({ error: 'invalid_credentials' });
+    if (config.features.emailVerificationEnabled && !user.email_verified_at) {
+      return res.status(403).json({
+        error: 'email_not_verified',
+        message: 'Please verify your email before signing in.'
+      });
+    }
     if (user.blocked_at) {
       return res.status(403).json({
         error: 'account_blocked',

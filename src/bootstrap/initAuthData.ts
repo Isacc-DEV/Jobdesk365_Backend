@@ -38,8 +38,8 @@ export async function initAuthData(): Promise<void> {
   let adminUserId = existing.rows[0]?.id || '';
   if (!adminUserId) {
     const inserted = await query<{ id: string }>(
-      `INSERT INTO users (id, email, username, password_hash, display_name, plan, verified)
-       VALUES ($1, $2, $3, $4, $5, 'free', true)
+      `INSERT INTO users (id, email, username, password_hash, display_name, plan, verified, email_verified_at)
+       VALUES ($1, $2, $3, $4, $5, 'free', true, now())
        RETURNING id`,
       [randomUUID(), ADMIN_EMAIL, ADMIN_USERNAME, ADMIN_PASSWORD_HASH, ADMIN_USERNAME]
     );
@@ -49,7 +49,8 @@ export async function initAuthData(): Promise<void> {
       `UPDATE users
        SET deleted_at = NULL,
            email = $2,
-           password_hash = $3
+           password_hash = $3,
+           email_verified_at = COALESCE(email_verified_at, now())
        WHERE id = $1`,
       [adminUserId, ADMIN_EMAIL, ADMIN_PASSWORD_HASH]
     );

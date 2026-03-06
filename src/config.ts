@@ -44,6 +44,13 @@ const requiredBoolean = (name: string): boolean => {
   return parsed ?? false;
 };
 
+const optionalBoolean = (name: string, defaultValue: boolean): boolean => {
+  const value = optionalString(name);
+  if (!value) return defaultValue;
+  const parsed = parseBooleanValue(name, value);
+  return parsed ?? defaultValue;
+};
+
 const requiredNumber = (
   name: string,
   options: {
@@ -58,6 +65,34 @@ const requiredNumber = (
   if (!Number.isFinite(parsed)) {
     addError(name, 'must be a valid number');
     return 0;
+  }
+  if (options.integer && !Number.isInteger(parsed)) {
+    addError(name, 'must be an integer');
+  }
+  if (typeof options.min === 'number' && parsed < options.min) {
+    addError(name, `must be >= ${options.min}`);
+  }
+  if (typeof options.max === 'number' && parsed > options.max) {
+    addError(name, `must be <= ${options.max}`);
+  }
+  return parsed;
+};
+
+const optionalNumber = (
+  name: string,
+  defaultValue: number,
+  options: {
+    integer?: boolean;
+    min?: number;
+    max?: number;
+  } = {}
+): number => {
+  const raw = optionalString(name);
+  if (!raw) return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    addError(name, 'must be a valid number');
+    return defaultValue;
   }
   if (options.integer && !Number.isInteger(parsed)) {
     addError(name, 'must be an integer');
@@ -249,18 +284,44 @@ const supabaseGroupState = validateAllOrNone('SUPABASE', [
     name: 'SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY)',
     present: hasValue('SUPABASE_SERVICE_ROLE_KEY') || hasValue('SUPABASE_SECRET_KEY')
   },
+  {
+    name: 'SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY)',
+    present: hasValue('SUPABASE_PUBLISHABLE_KEY') || hasValue('SUPABASE_ANON_KEY')
+  },
   { name: 'SUPABASE_AVATAR_BUCKET', present: hasValue('SUPABASE_AVATAR_BUCKET') }
 ]);
 
 const supabaseEnabled = supabaseGroupState === 'all';
 let supabaseUrl = '';
 let supabaseServiceRoleKey = '';
+let supabasePublishableKey = '';
 let supabaseAvatarBucket = '';
 
 if (supabaseEnabled) {
   supabaseUrl = requiredUrl('SUPABASE_URL');
   supabaseServiceRoleKey = requiredAliasString('SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY');
+  supabasePublishableKey = requiredAliasString('SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_ANON_KEY');
   supabaseAvatarBucket = requiredString('SUPABASE_AVATAR_BUCKET');
+}
+
+const emailVerificationEnabled = optionalBoolean('AUTH_EMAIL_VERIFICATION_ENABLED', true);
+const emailVerificationTtlSeconds = optionalNumber('AUTH_EMAIL_VERIFICATION_TTL_SECONDS', 900, {
+  integer: true,
+  min: 60
+});
+const emailVerificationResendCooldownSeconds = optionalNumber(
+  'AUTH_EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS',
+  60,
+  { integer: true, min: 1 }
+);
+const emailVerificationPath =
+  optionalString('AUTH_EMAIL_VERIFICATION_PATH').replace(/\s+/g, '') || '/auth/verify';
+
+if (!emailVerificationPath.startsWith('/')) {
+  addError('AUTH_EMAIL_VERIFICATION_PATH', 'must start with "/"');
+}
+if (emailVerificationEnabled && !supabaseEnabled) {
+  addError('AUTH_EMAIL_VERIFICATION_ENABLED', 'requires SUPABASE configuration');
 }
 
 export type Config = {
@@ -304,7 +365,14 @@ export type Config = {
   supabase: {
     url: string;
     serviceRoleKey: string;
+    publishableKey: string;
     avatarBucket: string;
+  };
+  auth: {
+    emailVerificationEnabled: boolean;
+    emailVerificationTtlSeconds: number;
+    emailVerificationResendCooldownSeconds: number;
+    emailVerificationPath: string;
   };
   nowpayments: {
     apiKey: string;
@@ -321,6 +389,7 @@ export type Config = {
     outlookOauthEnabled: boolean;
     nowpaymentsEnabled: boolean;
     supabaseEnabled: boolean;
+    emailVerificationEnabled: boolean;
   };
 };
 
@@ -369,7 +438,14 @@ export const config: Config = {
   supabase: {
     url: supabaseUrl,
     serviceRoleKey: supabaseServiceRoleKey,
+    publishableKey: supabasePublishableKey,
     avatarBucket: supabaseAvatarBucket
+  },
+  auth: {
+    emailVerificationEnabled,
+    emailVerificationTtlSeconds,
+    emailVerificationResendCooldownSeconds,
+    emailVerificationPath
   },
   nowpayments: {
     apiKey: nowpaymentsApiKey,
@@ -385,6 +461,7 @@ export const config: Config = {
   features: {
     outlookOauthEnabled: outlookEnabled,
     nowpaymentsEnabled: nowpaymentsEnabled,
-    supabaseEnabled
+    supabaseEnabled,
+    emailVerificationEnabled
   }
 };

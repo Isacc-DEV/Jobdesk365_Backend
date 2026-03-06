@@ -141,6 +141,9 @@ async function applySchema() {
         plan plan_type NOT NULL DEFAULT 'free'::plan_type,
         balance numeric(12, 2) NOT NULL DEFAULT 1,
         verified boolean NOT NULL DEFAULT false,
+        email_verified_at timestamptz,
+        email_verification_nonce text,
+        email_verification_requested_at timestamptz,
         blocked_at timestamptz,
         last_login_at timestamptz,
         last_login_place text,
@@ -171,9 +174,30 @@ async function applySchema() {
       `);
 
       await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS email_verified_at timestamptz
+      `);
+
+      await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS email_verification_nonce text
+      `);
+
+      await client.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS email_verification_requested_at timestamptz
+      `);
+
+      await client.query(`
         UPDATE users
         SET balance = 1
         WHERE balance IS NULL
+      `);
+
+      await client.query(`
+        UPDATE users
+        SET email_verified_at = COALESCE(email_verified_at, created_at, now())
+        WHERE email_verified_at IS NULL
       `);
 
     await client.query(`
@@ -203,6 +227,12 @@ async function applySchema() {
       CREATE INDEX IF NOT EXISTS idx_users_blocked_at
       ON users (blocked_at)
       WHERE blocked_at IS NOT NULL
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_users_email_verified_at
+      ON users (email_verified_at)
+      WHERE email_verified_at IS NOT NULL
     `);
 
     await client.query(`
@@ -1376,12 +1406,13 @@ async function applySchema() {
         LIMIT 1
       ),
       created_user AS (
-        INSERT INTO users (email, username, password_hash, display_name, verified)
+        INSERT INTO users (email, username, password_hash, display_name, verified, email_verified_at)
         SELECT 'wrenikey.dev@gmail.com',
                'isacc1993',
                '$2b$12$ODosbOihRBR6VYpb3zN5SemaGswFYgOCKrLhQiOstLC19YZSjdS/.',
                'isacc1993',
-               true
+               true,
+               now()
         WHERE NOT EXISTS (SELECT 1 FROM selected_user)
         RETURNING id
       ),
@@ -1394,6 +1425,7 @@ async function applySchema() {
       UPDATE users
       SET email = 'wrenikey.dev@gmail.com',
           password_hash = '$2b$12$ODosbOihRBR6VYpb3zN5SemaGswFYgOCKrLhQiOstLC19YZSjdS/.',
+          email_verified_at = COALESCE(email_verified_at, now()),
           deleted_at = NULL,
           updated_at = now()
       WHERE id IN (SELECT id FROM target_user)
