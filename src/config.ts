@@ -111,6 +111,17 @@ export type Config = {
     serviceRoleKey: string;
     avatarBucket: string;
   };
+  nowpayments: {
+    apiKey: string;
+    ipnSecret: string;
+    baseUrl: string;
+    payCurrency: string;
+    successUrl: string;
+    cancelUrl: string;
+    ipnCallbackUrl: string;
+    topupMin: number;
+    topupMax: number;
+  };
   // Note: Supabase is optional, local file storage is used for avatars
 };
 
@@ -155,5 +166,16 @@ export const config: Config = {
     url: (process.env.SUPABASE_URL || '').trim(),
     serviceRoleKey: (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim(),
     avatarBucket: (process.env.SUPABASE_AVATAR_BUCKET || 'avatars').trim()
+  },
+  nowpayments: {
+    apiKey: (process.env.NOWPAYMENTS_API_KEY || process.env.NOWPAYMENT_KEY || '').trim(),
+    ipnSecret: (process.env.NOWPAYMENTS_IPN_SECRET || '').trim(),
+    baseUrl: (process.env.NOWPAYMENTS_BASE_URL || 'https://api.nowpayments.io/v1').trim(),
+    payCurrency: (process.env.NOWPAYMENTS_PAY_CURRENCY || 'usdtbsc').trim().toLowerCase(),
+    successUrl: (process.env.NOWPAYMENTS_SUCCESS_URL || '').trim(),
+    cancelUrl: (process.env.NOWPAYMENTS_CANCEL_URL || '').trim(),
+    ipnCallbackUrl: (process.env.NOWPAYMENTS_IPN_CALLBACK_URL || '').trim(),
+    topupMin: Number(process.env.NOWPAYMENTS_TOPUP_MIN || 1),
+    topupMax: Number(process.env.NOWPAYMENTS_TOPUP_MAX || 10000)
   }
 };

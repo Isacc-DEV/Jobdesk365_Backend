@@ -206,6 +206,77 @@ async function applySchema() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS billing_topups (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        amount numeric(12, 2) NOT NULL CHECK (amount > 0),
+        price_currency text NOT NULL DEFAULT 'usd',
+        pay_currency text NOT NULL DEFAULT 'usdtbsc',
+        nowpayments_invoice_id text,
+        nowpayments_payment_id text,
+        nowpayments_order_id text NOT NULL,
+        checkout_url text,
+        payment_status text NOT NULL DEFAULT 'waiting',
+        credited_at timestamptz,
+        credited_amount numeric(12, 2),
+        ipn_last_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      )
+    `);
+
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints
+          WHERE constraint_name = 'billing_topups_order_id_unique'
+            AND table_name = 'billing_topups'
+        ) THEN
+          ALTER TABLE billing_topups
+          ADD CONSTRAINT billing_topups_order_id_unique UNIQUE (nowpayments_order_id);
+        END IF;
+      END
+      $$;
+    `);
+
+    await client.query(`
+      DROP TRIGGER IF EXISTS trg_billing_topups_updated_at ON billing_topups;
+      CREATE TRIGGER trg_billing_topups_updated_at
+      BEFORE UPDATE ON billing_topups
+      FOR EACH ROW
+      EXECUTE FUNCTION set_row_updated_at();
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_billing_topups_user_id
+      ON billing_topups (user_id, created_at DESC)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_billing_topups_payment_status
+      ON billing_topups (payment_status)
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_billing_topups_credited_at
+      ON billing_topups (credited_at DESC)
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_invoice_id
+      ON billing_topups (nowpayments_invoice_id)
+      WHERE nowpayments_invoice_id IS NOT NULL
+    `);
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_topups_payment_id
+      ON billing_topups (nowpayments_payment_id)
+      WHERE nowpayments_payment_id IS NOT NULL
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS notifications (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
