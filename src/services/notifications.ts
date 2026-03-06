@@ -479,9 +479,6 @@ export async function createInterviewReminderNotifications(offsetMinutes: 30 | 5
             'calendar_reminder:' || ce.id::text || ':' || $3::text || ':' || ce.start_at::text,
             jsonb_build_object('calendar_event_id', ce.id, 'start_at', ce.start_at, 'offset_minutes', $3)
      FROM calendar_events ce
-     JOIN talents t
-       ON COALESCE(t.user_id, t.id) = ce.assigned_user_id
-      AND t.talent_role = 'caller'
      JOIN users u ON u.id = ce.assigned_user_id
      WHERE ce.assigned_user_id IS NOT NULL
        AND ce.start_at IS NOT NULL
