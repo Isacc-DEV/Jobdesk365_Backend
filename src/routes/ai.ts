@@ -4,8 +4,9 @@ import { query } from '../db.js';
 import { authRequired, fetchCurrentUser } from '../middleware/auth.js';
 
 const router = express.Router();
-const RESUME_GENERATE_COST = 0.04;
-const RESUME_REGENERATE_COST = 0.02;
+const RESUME_GENERATE_COST = 0.05;
+const RESUME_REGENERATE_BASE_COST = 0.03;
+const RESUME_REGENERATE_STEP_COST = 0.005;
 const hasRole = (roles: string[] | null | undefined, role: string) =>
   Array.isArray(roles) && roles.includes(role);
 
@@ -20,6 +21,16 @@ type AiErrorResponse = {
 const buildAiUrl = () => {
   const base = config.ai.baseUrl.replace(/\/+$/, '');
   return `${base}/chat/completions`;
+};
+
+const resolveRegenerateCharge = (rawGenerationTime: unknown) => {
+  const parsed = Number(rawGenerationTime);
+  const generationTime =
+    Number.isFinite(parsed) && parsed > 0 ? Math.max(1, Math.floor(parsed)) : 1;
+  const amount =
+    RESUME_REGENERATE_BASE_COST +
+    RESUME_REGENERATE_STEP_COST * Math.max(0, generationTime - 1);
+  return Math.round(amount * 1000) / 1000;
 };
 
 const SYSTEM_PROMPT = `You are an expert resume writer and ResumeTailorJSON.
@@ -516,6 +527,11 @@ router.post('/resume-tailor', async (req, res, next) => {
 
   const { job_description, profile_id } = req.body || {};
   const regenerate = Boolean(req.body?.regenerate);
+  const generationTimeInput =
+    req.body?.generation_time ??
+    req.body?.generationTime ??
+    req.body?.regeneration_time ??
+    req.body?.regenerationTime;
   if (!job_description || typeof job_description !== 'string') {
     return res.status(400).json({ error: 'missing_job_description' });
   }
@@ -524,7 +540,9 @@ router.post('/resume-tailor', async (req, res, next) => {
   }
 
   let charged = false;
-  let chargeAmount = regenerate ? RESUME_REGENERATE_COST : RESUME_GENERATE_COST;
+  let chargeAmount = regenerate
+    ? resolveRegenerateCharge(generationTimeInput)
+    : RESUME_GENERATE_COST;
   if (!Number.isFinite(chargeAmount) || chargeAmount < 0) chargeAmount = 0;
   const isAdmin = hasRole(req.currentUser?.roles, 'admin');
   let chargeUserId = req.currentUser.id;

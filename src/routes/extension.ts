@@ -11,8 +11,8 @@ import {
 const router = express.Router();
 type TalentRole = 'bidder' | 'caller';
 
-const BIDDER_BASE_RATE = 0.07;
-const CALLER_BASE_RATE = 0.5;
+const BIDDER_BASE_RATE = 0.08;
+const CALLER_BASE_RATE = 0.7;
 
 const getRoleBaseRate = (role: TalentRole): number =>
   role === 'caller' ? CALLER_BASE_RATE : BIDDER_BASE_RATE;
