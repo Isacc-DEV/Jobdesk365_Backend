@@ -38,6 +38,17 @@ The server listens on `http://localhost:4000` by default.
 - `CORS_ORIGINS=https://jobdesk365.com,https://www.jobdesk365.com`
 - `MS_REDIRECT_URI=https://api.jobdesk365.com/email/outlook/callback`
 
+## Minimum Production Env Checklist
+- Required:
+- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- `JWT_SECRET`
+- `FRONTEND_URL`
+- `CORS_ORIGINS` (when `CORS_ALLOW_ALL=false`)
+- Optional feature groups (must be complete if enabled):
+- Outlook OAuth: `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_REDIRECT_URI` (+ `MS_TENANT_ID`)
+- NOWPayments: `NOWPAYMENTS_API_KEY` (or `NOWPAYMENT_KEY`), `NOWPAYMENTS_IPN_SECRET`, `NOWPAYMENTS_SUCCESS_URL`, `NOWPAYMENTS_CANCEL_URL`, `NOWPAYMENTS_IPN_CALLBACK_URL`
+- Supabase avatars: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+
 ## Auth API
 - `POST /auth/register` â€” body: `{ email, username, password, display_name?, bio?, photo_link?, plan? }` â†’ returns `{ token, user }`
 - Username rules: lowercase letters and numbers only; must be unique per active user.

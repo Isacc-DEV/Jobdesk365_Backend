@@ -92,6 +92,6 @@ startNotificationScheduler();
 void (async () => {
   await initAuthData();
   server.listen(config.port, () => {
-    console.log(`API listening on http://localhost:${config.port}`);
+    console.log(`API listening on port ${config.port} (${config.nodeEnv})`);
   });
 })();

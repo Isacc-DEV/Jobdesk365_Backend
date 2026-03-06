@@ -49,7 +49,7 @@ const mapResumeDateIssues = (issues: ResumeDateIssue[]) =>
   }));
 
 function isOutlookConfigured(): boolean {
-  return Boolean(config.outlook.clientId && config.outlook.clientSecret && config.outlook.redirectUri);
+  return config.features.outlookOauthEnabled;
 }
 
 function buildOutlookAuthorizeUrl(state: string): string {

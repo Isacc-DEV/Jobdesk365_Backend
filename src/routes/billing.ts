@@ -146,11 +146,13 @@ const parseAmount = (value: unknown): number | null => {
 };
 
 const getTopupBounds = () => {
-  const minRaw = Number(config.nowpayments.topupMin);
-  const maxRaw = Number(config.nowpayments.topupMax);
-  const min = Number.isFinite(minRaw) && minRaw > 0 ? Math.round(minRaw * 100) / 100 : 1;
-  const maxBase = Number.isFinite(maxRaw) && maxRaw > 0 ? Math.round(maxRaw * 100) / 100 : 10000;
-  const max = maxBase < min ? min : maxBase;
+  const minRaw = config.nowpayments.topupMin;
+  const maxRaw = config.nowpayments.topupMax;
+  const min = typeof minRaw === 'number' && Number.isFinite(minRaw) ? Math.round(minRaw * 100) / 100 : NaN;
+  const max = typeof maxRaw === 'number' && Number.isFinite(maxRaw) ? Math.round(maxRaw * 100) / 100 : NaN;
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min <= 0 || max < min) {
+    throw new Error('billing_topup_bounds_not_configured');
+  }
   return { min, max };
 };
 
@@ -379,6 +381,13 @@ router.post('/nowpayments/ipn', async (req, res, next) => {
 router.use(authRequired, fetchCurrentUser);
 
 router.post('/topups/checkout', async (req, res, next) => {
+  if (!config.features.nowpaymentsEnabled) {
+    return res.status(503).json({
+      error: 'billing_not_configured',
+      message: 'NOWPayments integration is not fully configured.'
+    });
+  }
+
   const amount = parseAmount(req.body?.amount);
   if (amount === null) {
     return res.status(400).json({
@@ -391,20 +400,6 @@ router.post('/topups/checkout', async (req, res, next) => {
     return res.status(400).json({
       error: 'amount_out_of_range',
       message: `Amount must be between ${min.toFixed(2)} and ${max.toFixed(2)}.`
-    });
-  }
-  if (!config.nowpayments.apiKey) {
-    return res.status(503).json({ error: 'billing_not_configured', message: 'Missing NOWPayments API key.' });
-  }
-  if (!config.nowpayments.successUrl || !config.nowpayments.cancelUrl) {
-    return res
-      .status(503)
-      .json({ error: 'billing_not_configured', message: 'Missing NOWPayments success/cancel URLs.' });
-  }
-  if (!config.nowpayments.ipnSecret || !config.nowpayments.ipnCallbackUrl) {
-    return res.status(503).json({
-      error: 'billing_not_configured',
-      message: 'Missing NOWPayments IPN secret or callback URL.'
     });
   }
 

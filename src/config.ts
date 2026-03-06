@@ -1,75 +1,270 @@
 import dotenv from 'dotenv';
 
-const nodeEnv = (process.env.NODE_ENV || 'development').trim();
-const envFilePath = `.env.${nodeEnv}`;
-const envLoadResult = dotenv.config({ path: envFilePath });
-if (envLoadResult.error) {
-  dotenv.config();
+dotenv.config();
+
+type AiProvider = 'openai' | 'huggingface';
+type GroupState = 'none' | 'all' | 'partial';
+
+const configErrors: string[] = [];
+
+const readRaw = (name: string): string => {
+  const value = process.env[name];
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+const hasValue = (name: string): boolean => readRaw(name).length > 0;
+
+const addError = (name: string, message: string) => {
+  configErrors.push(`${name}: ${message}`);
+};
+
+const requiredString = (name: string): string => {
+  const value = readRaw(name);
+  if (!value) {
+    addError(name, 'is required');
+    return '';
+  }
+  return value;
+};
+
+const optionalString = (name: string): string => readRaw(name);
+
+const parseBooleanValue = (name: string, value: string): boolean | null => {
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes'].includes(normalized)) return true;
+  if (['false', '0', 'no'].includes(normalized)) return false;
+  addError(name, 'must be a boolean (true/false)');
+  return null;
+};
+
+const requiredBoolean = (name: string): boolean => {
+  const value = requiredString(name);
+  if (!value) return false;
+  const parsed = parseBooleanValue(name, value);
+  return parsed ?? false;
+};
+
+const requiredNumber = (
+  name: string,
+  options: {
+    integer?: boolean;
+    min?: number;
+    max?: number;
+  } = {}
+): number => {
+  const raw = requiredString(name);
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    addError(name, 'must be a valid number');
+    return 0;
+  }
+  if (options.integer && !Number.isInteger(parsed)) {
+    addError(name, 'must be an integer');
+  }
+  if (typeof options.min === 'number' && parsed < options.min) {
+    addError(name, `must be >= ${options.min}`);
+  }
+  if (typeof options.max === 'number' && parsed > options.max) {
+    addError(name, `must be <= ${options.max}`);
+  }
+  return parsed;
+};
+
+const parseAbsoluteUrl = (name: string, value: string): string => {
+  try {
+    const parsed = new URL(value);
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    addError(name, 'must be a valid absolute URL');
+    return value;
+  }
+};
+
+const requiredUrl = (name: string): string => {
+  const value = requiredString(name);
+  if (!value) return '';
+  return parseAbsoluteUrl(name, value);
+};
+
+const optionalUrl = (name: string): string => {
+  const value = optionalString(name);
+  if (!value) return '';
+  return parseAbsoluteUrl(name, value);
+};
+
+const requiredAliasString = (primaryName: string, aliasName: string): string => {
+  const primary = optionalString(primaryName);
+  if (primary) return primary;
+  const alias = optionalString(aliasName);
+  if (alias) return alias;
+  addError(`${primaryName}/${aliasName}`, 'is required');
+  return '';
+};
+
+const parseOrigins = (rawOrigins: string): string[] => {
+  const values = rawOrigins
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  const parsedOrigins: string[] = [];
+  for (const value of values) {
+    try {
+      parsedOrigins.push(new URL(value).origin);
+    } catch {
+      addError('CORS_ORIGINS', `contains invalid URL: ${value}`);
+    }
+  }
+  return Array.from(new Set(parsedOrigins));
+};
+
+const parseScopes = (rawScopes: string): string[] =>
+  rawScopes
+    .split(' ')
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+
+const validateAllOrNone = (
+  groupName: string,
+  fields: Array<{ name: string; present: boolean }>
+): GroupState => {
+  const present = fields.filter((field) => field.present);
+  if (!present.length) return 'none';
+  if (present.length === fields.length) return 'all';
+
+  const missing = fields.filter((field) => !field.present).map((field) => field.name);
+  addError(groupName, `partial configuration. Missing: ${missing.join(', ')}`);
+  return 'partial';
+};
+
+const nodeEnv = optionalString('NODE_ENV') || 'development';
+
+const port = requiredNumber('PORT', { integer: true, min: 1, max: 65535 });
+const frontendUrl = requiredUrl('FRONTEND_URL');
+const corsAllowAll = requiredBoolean('CORS_ALLOW_ALL');
+const corsOrigins = parseOrigins(optionalString('CORS_ORIGINS'));
+if (!corsAllowAll && corsOrigins.length === 0) {
+  addError('CORS_ORIGINS', 'must include at least one origin when CORS_ALLOW_ALL=false');
 }
 
-const defaultScopes = [
-  'offline_access',
-  'https://graph.microsoft.com/User.Read',
-  'https://graph.microsoft.com/Mail.Read',
-  'https://graph.microsoft.com/Calendars.Read'
-].join(' ');
+const dbHost = requiredString('DB_HOST');
+const dbPort = requiredNumber('DB_PORT', { integer: true, min: 1, max: 65535 });
+const dbUser = requiredString('DB_USER');
+const dbPassword = requiredString('DB_PASSWORD');
+const dbName = requiredString('DB_NAME');
+const dbSsl = requiredBoolean('DB_SSL');
 
-const outlookScopes = (process.env.MS_SCOPES || defaultScopes).split(' ').filter(Boolean);
+const jwtSecret = requiredString('JWT_SECRET');
+const jwtExpiresIn = requiredString('JWT_EXPIRES_IN');
 
-const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-const defaultOrigin = (() => {
-  try {
-    return new URL(frontendUrl).origin;
-  } catch {
-    return frontendUrl;
+const aiProviderRaw = requiredString('AI_PROVIDER').toLowerCase();
+let aiProvider: AiProvider = 'openai';
+if (aiProviderRaw === 'openai' || aiProviderRaw === 'huggingface') {
+  aiProvider = aiProviderRaw;
+} else {
+  addError('AI_PROVIDER', 'must be either "openai" or "huggingface"');
+}
+
+let aiApiKey = '';
+let aiModel = '';
+let aiBaseUrl = '';
+
+if (aiProvider === 'openai') {
+  aiApiKey = requiredString('OPENAI_API_KEY');
+  aiModel = requiredString('OPENAI_MODEL');
+  aiBaseUrl = requiredUrl('OPENAI_BASE_URL');
+} else {
+  aiApiKey = requiredString('HUGGINGFACE_API_KEY');
+  aiModel = requiredString('HUGGINGFACE_MODEL');
+  aiBaseUrl = requiredUrl('HUGGINGFACE_BASE_URL');
+}
+
+const outlookGroupState = validateAllOrNone('OUTLOOK_OAUTH', [
+  { name: 'MS_CLIENT_ID', present: hasValue('MS_CLIENT_ID') },
+  { name: 'MS_CLIENT_SECRET', present: hasValue('MS_CLIENT_SECRET') },
+  { name: 'MS_TENANT_ID', present: hasValue('MS_TENANT_ID') },
+  { name: 'MS_REDIRECT_URI', present: hasValue('MS_REDIRECT_URI') },
+  { name: 'MS_SCOPES', present: hasValue('MS_SCOPES') }
+]);
+
+const outlookEnabled = outlookGroupState === 'all';
+let outlookClientId = '';
+let outlookClientSecret = '';
+let outlookTenantId = '';
+let outlookRedirectUri = '';
+let outlookScopes: string[] = [];
+
+if (outlookEnabled) {
+  outlookClientId = requiredString('MS_CLIENT_ID');
+  outlookClientSecret = requiredString('MS_CLIENT_SECRET');
+  outlookTenantId = requiredString('MS_TENANT_ID');
+  outlookRedirectUri = requiredUrl('MS_REDIRECT_URI');
+  outlookScopes = parseScopes(requiredString('MS_SCOPES'));
+  if (!outlookScopes.length) {
+    addError('MS_SCOPES', 'must contain at least one scope');
   }
-})();
+}
 
-const devOrigins = [
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'http://localhost:5174',
-  'http://127.0.0.1:5174',
-  'http://localhost:3000',
-  'http://127.0.0.1:3000'
-];
-const includeDevOrigins =
-  process.env.CORS_INCLUDE_DEV_ORIGINS === 'true' || nodeEnv !== 'production';
+const nowpaymentsGroupState = validateAllOrNone('NOWPAYMENTS', [
+  {
+    name: 'NOWPAYMENTS_API_KEY (or NOWPAYMENT_KEY)',
+    present: hasValue('NOWPAYMENTS_API_KEY') || hasValue('NOWPAYMENT_KEY')
+  },
+  { name: 'NOWPAYMENTS_IPN_SECRET', present: hasValue('NOWPAYMENTS_IPN_SECRET') },
+  { name: 'NOWPAYMENTS_BASE_URL', present: hasValue('NOWPAYMENTS_BASE_URL') },
+  { name: 'NOWPAYMENTS_PAY_CURRENCY', present: hasValue('NOWPAYMENTS_PAY_CURRENCY') },
+  { name: 'NOWPAYMENTS_SUCCESS_URL', present: hasValue('NOWPAYMENTS_SUCCESS_URL') },
+  { name: 'NOWPAYMENTS_CANCEL_URL', present: hasValue('NOWPAYMENTS_CANCEL_URL') },
+  { name: 'NOWPAYMENTS_IPN_CALLBACK_URL', present: hasValue('NOWPAYMENTS_IPN_CALLBACK_URL') },
+  { name: 'NOWPAYMENTS_TOPUP_MIN', present: hasValue('NOWPAYMENTS_TOPUP_MIN') },
+  { name: 'NOWPAYMENTS_TOPUP_MAX', present: hasValue('NOWPAYMENTS_TOPUP_MAX') }
+]);
 
-const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const nowpaymentsEnabled = nowpaymentsGroupState === 'all';
+let nowpaymentsApiKey = '';
+let nowpaymentsIpnSecret = '';
+let nowpaymentsBaseUrl = '';
+let nowpaymentsPayCurrency = '';
+let nowpaymentsSuccessUrl = '';
+let nowpaymentsCancelUrl = '';
+let nowpaymentsIpnCallbackUrl = '';
+let nowpaymentsTopupMin: number | null = null;
+let nowpaymentsTopupMax: number | null = null;
 
-const corsOrigins = Array.from(
-  new Set([defaultOrigin, ...(includeDevOrigins ? devOrigins : []), ...extraCorsOrigins])
-);
+if (nowpaymentsEnabled) {
+  nowpaymentsApiKey = requiredAliasString('NOWPAYMENTS_API_KEY', 'NOWPAYMENT_KEY');
+  nowpaymentsIpnSecret = requiredString('NOWPAYMENTS_IPN_SECRET');
+  nowpaymentsBaseUrl = requiredUrl('NOWPAYMENTS_BASE_URL');
+  nowpaymentsPayCurrency = requiredString('NOWPAYMENTS_PAY_CURRENCY').toLowerCase();
+  nowpaymentsSuccessUrl = requiredUrl('NOWPAYMENTS_SUCCESS_URL');
+  nowpaymentsCancelUrl = requiredUrl('NOWPAYMENTS_CANCEL_URL');
+  nowpaymentsIpnCallbackUrl = requiredUrl('NOWPAYMENTS_IPN_CALLBACK_URL');
+  nowpaymentsTopupMin = requiredNumber('NOWPAYMENTS_TOPUP_MIN', { min: 0.01 });
+  nowpaymentsTopupMax = requiredNumber('NOWPAYMENTS_TOPUP_MAX', { min: nowpaymentsTopupMin });
+}
 
-const openAiApiKey = (process.env.OPENAI_API_KEY || '').trim();
-const huggingFaceApiKey = (process.env.HUGGINGFACE_API_KEY || process.env.HF_API_KEY || '').trim();
-const preferredAiProvider = (process.env.AI_PROVIDER || '').trim().toLowerCase();
-const forceHuggingFace = preferredAiProvider === 'huggingface';
-const forceOpenAi = preferredAiProvider === 'openai';
+const supabaseGroupState = validateAllOrNone('SUPABASE', [
+  { name: 'SUPABASE_URL', present: hasValue('SUPABASE_URL') },
+  {
+    name: 'SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY)',
+    present: hasValue('SUPABASE_SERVICE_ROLE_KEY') || hasValue('SUPABASE_SECRET_KEY')
+  },
+  { name: 'SUPABASE_AVATAR_BUCKET', present: hasValue('SUPABASE_AVATAR_BUCKET') }
+]);
 
-const aiProvider: 'openai' | 'huggingface' = forceOpenAi
-  ? 'openai'
-  : forceHuggingFace || (!openAiApiKey && Boolean(huggingFaceApiKey))
-  ? 'huggingface'
-  : 'openai';
+const supabaseEnabled = supabaseGroupState === 'all';
+let supabaseUrl = '';
+let supabaseServiceRoleKey = '';
+let supabaseAvatarBucket = '';
 
-const aiModel = aiProvider === 'huggingface'
-  ? process.env.HUGGINGFACE_MODEL || process.env.OPENAI_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
-  : process.env.OPENAI_MODEL || 'gpt-4o-mini';
-
-const aiBaseUrl = aiProvider === 'huggingface'
-  ? process.env.HUGGINGFACE_BASE_URL || 'https://router.huggingface.co/v1'
-  : process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-
-const aiApiKey = aiProvider === 'huggingface'
-  ? huggingFaceApiKey || openAiApiKey
-  : openAiApiKey || huggingFaceApiKey;
+if (supabaseEnabled) {
+  supabaseUrl = requiredUrl('SUPABASE_URL');
+  supabaseServiceRoleKey = requiredAliasString('SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY');
+  supabaseAvatarBucket = requiredString('SUPABASE_AVATAR_BUCKET');
+}
 
 export type Config = {
+  nodeEnv: string;
   port: number;
   frontendUrl: string;
   cors: {
@@ -101,7 +296,7 @@ export type Config = {
     baseUrl: string;
   };
   ai: {
-    provider: 'openai' | 'huggingface';
+    provider: AiProvider;
     apiKey: string;
     model: string;
     baseUrl: string;
@@ -119,36 +314,45 @@ export type Config = {
     successUrl: string;
     cancelUrl: string;
     ipnCallbackUrl: string;
-    topupMin: number;
-    topupMax: number;
+    topupMin: number | null;
+    topupMax: number | null;
   };
-  // Note: Supabase is optional, local file storage is used for avatars
+  features: {
+    outlookOauthEnabled: boolean;
+    nowpaymentsEnabled: boolean;
+    supabaseEnabled: boolean;
+  };
 };
 
+if (configErrors.length > 0) {
+  throw new Error(`Invalid environment configuration:\n- ${configErrors.join('\n- ')}`);
+}
+
 export const config: Config = {
-  port: Number(process.env.PORT || 4000),
+  nodeEnv,
+  port,
   frontendUrl,
   cors: {
-    allowAll: process.env.CORS_ALLOW_ALL === 'true',
+    allowAll: corsAllowAll,
     origins: corsOrigins
   },
   db: {
-    host: process.env.DB_HOST || 'localhost',
-    port: Number(process.env.DB_PORT || 5432),
-    user: process.env.DB_USER || 'postgres',
-    password: process.env.DB_PASSWORD ?? 'postgres',
-    database: process.env.DB_NAME || 'jobdesk365',
-    ssl: process.env.DB_SSL === 'true'
+    host: dbHost,
+    port: dbPort,
+    user: dbUser,
+    password: dbPassword,
+    database: dbName,
+    ssl: dbSsl
   },
   jwt: {
-    secret: process.env.JWT_SECRET || 'dev-secret-change-me',
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
+    secret: jwtSecret,
+    expiresIn: jwtExpiresIn
   },
   outlook: {
-    clientId: process.env.MS_CLIENT_ID || '',
-    clientSecret: process.env.MS_CLIENT_SECRET || '',
-    tenantId: process.env.MS_TENANT_ID || 'common',
-    redirectUri: process.env.MS_REDIRECT_URI || 'http://localhost:4000/email/outlook/callback',
+    clientId: outlookClientId,
+    clientSecret: outlookClientSecret,
+    tenantId: outlookTenantId,
+    redirectUri: outlookRedirectUri,
     scopes: outlookScopes
   },
   openai: {
@@ -163,19 +367,24 @@ export const config: Config = {
     baseUrl: aiBaseUrl
   },
   supabase: {
-    url: (process.env.SUPABASE_URL || '').trim(),
-    serviceRoleKey: (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim(),
-    avatarBucket: (process.env.SUPABASE_AVATAR_BUCKET || 'avatars').trim()
+    url: supabaseUrl,
+    serviceRoleKey: supabaseServiceRoleKey,
+    avatarBucket: supabaseAvatarBucket
   },
   nowpayments: {
-    apiKey: (process.env.NOWPAYMENTS_API_KEY || process.env.NOWPAYMENT_KEY || '').trim(),
-    ipnSecret: (process.env.NOWPAYMENTS_IPN_SECRET || '').trim(),
-    baseUrl: (process.env.NOWPAYMENTS_BASE_URL || 'https://api.nowpayments.io/v1').trim(),
-    payCurrency: (process.env.NOWPAYMENTS_PAY_CURRENCY || 'usdtbsc').trim().toLowerCase(),
-    successUrl: (process.env.NOWPAYMENTS_SUCCESS_URL || '').trim(),
-    cancelUrl: (process.env.NOWPAYMENTS_CANCEL_URL || '').trim(),
-    ipnCallbackUrl: (process.env.NOWPAYMENTS_IPN_CALLBACK_URL || '').trim(),
-    topupMin: Number(process.env.NOWPAYMENTS_TOPUP_MIN || 1),
-    topupMax: Number(process.env.NOWPAYMENTS_TOPUP_MAX || 10000)
+    apiKey: nowpaymentsApiKey,
+    ipnSecret: nowpaymentsIpnSecret,
+    baseUrl: nowpaymentsBaseUrl,
+    payCurrency: nowpaymentsPayCurrency,
+    successUrl: nowpaymentsSuccessUrl,
+    cancelUrl: nowpaymentsCancelUrl,
+    ipnCallbackUrl: nowpaymentsIpnCallbackUrl,
+    topupMin: nowpaymentsTopupMin,
+    topupMax: nowpaymentsTopupMax
+  },
+  features: {
+    outlookOauthEnabled: outlookEnabled,
+    nowpaymentsEnabled: nowpaymentsEnabled,
+    supabaseEnabled
   }
 };

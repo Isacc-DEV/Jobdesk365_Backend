@@ -828,7 +828,7 @@ router.get('/outlook/callback', async (req, res, next) => {
       .send(renderCallbackPage({ status: 'error', message: 'Missing code or state.', traceId }));
   }
 
-  if (!config.outlook.clientId || !config.outlook.clientSecret || !config.outlook.redirectUri) {
+  if (!config.features.outlookOauthEnabled) {
     logOutlookCallback('outlook_not_configured', traceId, {
       has_client_id: Boolean(config.outlook.clientId),
       has_client_secret: Boolean(config.outlook.clientSecret),
